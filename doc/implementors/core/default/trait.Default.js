@@ -1,0 +1,3 @@
+(function() {var implementors = {
+"recycle_buf":[["impl&lt;T&gt; <a class=\"trait\" href=\"https://doc.rust-lang.org/1.65.0/core/default/trait.Default.html\" title=\"trait core::default::Default\">Default</a> for <a class=\"struct\" href=\"recycle_buf/struct.RecyclerBuilder.html\" title=\"struct recycle_buf::RecyclerBuilder\">RecyclerBuilder</a>&lt;T&gt;"]]
+};if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

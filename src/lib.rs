@@ -1,10 +1,15 @@
+//! This module implements a recycler buffer system that allows for pre-allocation and memory reuse
+//! by leveraging the Rust language's drop mechanics. The main motivation for this system is avoiding
+//! memory allocations of large and/or expensive to create objects in a realtime environment
+
 use std::{sync::{Arc, Condvar, Mutex, atomic::{Ordering, AtomicU32}}, ptr::NonNull, ops::{Deref, DerefMut}, time::Duration, borrow::{self}};
 
 type RecyclerInnerType<T> = Arc<(Mutex<RecyclerInner<T>>, Condvar)>;
 
 type ContentType<T> = NonNull<ItemHolder<T>>;
 
-
+/// Uses the builder pattern to pre allocate T instances
+/// and build the [Recycler]
 pub struct RecyclerBuilder<T> {
     contents: Vec<ContentType<T>>
 }
@@ -25,6 +30,7 @@ impl<T> RecyclerBuilder<T> {
         RecyclerBuilder { contents: vec![] }
     }
 
+    /// moves a pre-constructed instance of T and makes it available in the recycler buffer when created
     pub fn push(mut self, item: T) -> Self {
         // move the item to the heap via box
         let boxed = Box::new(ItemHolder {item, ref_counter: AtomicU32::new(0)});
@@ -34,6 +40,7 @@ impl<T> RecyclerBuilder<T> {
         Self {contents: self.contents}
     }
 
+    /// creates the recycler
     pub fn build(self) -> Recycler<T> {
 
         let contents = self.contents.into_boxed_slice();
@@ -52,6 +59,7 @@ impl<T> RecyclerBuilder<T> {
     }
 }
 
+/// A buffer that manages the recycling of dropped items that were pulled from this buffer.
 pub struct Recycler<T> {
     inner: RecyclerInnerType<T>
 }
@@ -64,6 +72,7 @@ struct RecyclerInner<T> {
 
 impl<T> Drop for RecyclerInner<T> {
     fn drop(&mut self) {
+        // we have to manually drop each item in the buffer
         for i in 0 ..self.data.len() {
             let boxed = unsafe {Box::from_raw(self.data[i].as_ptr())};
             drop(boxed)
@@ -80,6 +89,7 @@ impl<T> RecyclerInner<T> {
     }
 
     #[inline]
+    /// takes an item from the internal buffer
     fn pop(&mut self) -> ContentType<T>{
         let item= self.data[self.index];        
         self.index += 1;
@@ -105,12 +115,15 @@ impl <T> Recycler<T> {
     pub fn take(&mut self)-> Option<RecycleRef<T>> {
         let mut inner = self.inner.0.lock().unwrap();
         if inner.index == inner.data.len(){
+            // empty
             None
         } else {
             Some(self.make_ref(inner.pop()))
         }
     }
 
+    /// waits for an item to be available, runs the given function, and returns
+    /// a shareable reference. This avoids an intermediate [RecycleRef] creation
     #[inline]
     pub fn wait_and_share<F: FnOnce(&mut T)>(&mut self, f: F) -> SharedRecycleRef<T> {
         let mut inner = self.inner.0.lock().unwrap();
@@ -132,6 +145,8 @@ impl <T> Recycler<T> {
     /// waits for one item to be available in the buffer. 
     pub fn wait_and_take(&self)-> RecycleRef<T> {
         let mut inner = self.inner.0.lock().unwrap();
+
+        // loop until a new item is available
         while inner.index == inner.data.len() {
             inner = self.inner.1.wait(inner).unwrap();
         }
@@ -159,11 +174,14 @@ impl <T> Recycler<T> {
         None
     }
 
+    /// returns the number of items currently available in the recycler. This
+    /// number can change any time after a call to this function in multithreaded scenarios.
     #[inline]
     pub fn available(&self) -> usize {
         self.inner.0.lock().unwrap().available()
     }
 
+    /// returns the maximum number of items that can be stored in this recycler
     #[inline]
     pub fn capacity(&self) -> usize {
         self.inner.0.lock().unwrap().data.len()
@@ -172,6 +190,10 @@ impl <T> Recycler<T> {
 
 }
 
+/// a reference to a managed T instance that allows mutation. 
+/// When the reference is destroyed then the managed T instance will
+/// be recycled back into the [Recycler]. This reference is not thread safe
+/// but shareable thread safe references can be created by calling [RecycleRef::to_shared]
 pub struct RecycleRef<T> {
     buf_ptr: RecyclerInnerType<T>,
     item_ptr: * mut ItemHolder<T>,
@@ -216,7 +238,6 @@ impl<T> Drop for RecycleRef<T> {
     fn drop(&mut self) {
 
         if !self.item_ptr.is_null() {
-            println!("single man standing");
             // we are the last reference remaining. We are now responsible for returning the
             // data to the main buffer
             let mut inner = self.buf_ptr.0.lock().unwrap();
@@ -227,6 +248,9 @@ impl<T> Drop for RecycleRef<T> {
     }
 }
 
+/// A thread safe recycle reference that allows read access to the underlying
+/// item. Once all instances of the shared recycle reference that contain the same
+/// item are drop then the item is recycled back into the recycler buffer. 
 #[derive(Debug)]
 pub struct SharedRecycleRef<T> {
     buf_ptr: RecyclerInnerType<T>,
@@ -236,9 +260,7 @@ pub struct SharedRecycleRef<T> {
 impl<T> SharedRecycleRef<T> {
 
     fn new(buf_ptr: RecyclerInnerType<T>, item_ptr: ContentType<T>) -> Self {
-        unsafe {
-            item_ptr.as_ref().ref_counter.store(1, Ordering::Relaxed);
-        }
+        unsafe {item_ptr.as_ref()}.ref_counter.store(1, Ordering::Relaxed);
         SharedRecycleRef { 
             buf_ptr, 
             item_ptr, 
@@ -287,7 +309,6 @@ impl<T> Drop for SharedRecycleRef<T> {
         let counter = unsafe { &self.item_ptr.as_ref().ref_counter };
 
         let value = counter.fetch_sub(1, Ordering::Release);
-        //println!("drop checking: {}", value);
 
         if value != 1 {
             return;

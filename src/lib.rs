@@ -2,53 +2,69 @@
 //! by leveraging the Rust language's drop mechanics. The main motivation for this system is avoiding
 //! memory allocations of large and/or expensive to create objects in a realtime environment
 
-use std::{sync::{Arc, Condvar, Mutex, atomic::{Ordering, AtomicU32}}, ptr::NonNull, ops::{Deref, DerefMut}, time::Duration, borrow::{self}};
+use std::{sync::{Arc, Condvar, Mutex, atomic::{Ordering, AtomicU32}}, ptr::{NonNull}, ops::{Deref, DerefMut}, time::Duration,};
 
-type RecyclerInnerType<T> = Arc<(Mutex<RecyclerInner<T>>, Condvar)>;
+pub type DynamicBufferPtr<T> = Arc<(Mutex<DynamicBuffer<T>>, Condvar)>;
+pub type StaticBufferPtr<T, const N: usize> = Arc<(Mutex<StaticBuffer<T,N>>, Condvar)>;
 
-type ContentType<T> = NonNull<ItemHolder<T>>;
+pub type ContainerType<T> = NonNull<ItemCounter<T>>;
 
 /// Uses the builder pattern to pre allocate T instances
 /// and build the [Recycler]
 pub struct RecyclerBuilder<T> {
-    contents: Vec<ContentType<T>>
+    contents: Vec<ContainerType<T>>
 }
 
-struct ItemHolder<T> {
+pub struct ItemCounter<T> {
     ref_counter: AtomicU32,
     item: T,
 }
 
-impl<T> Default for RecyclerBuilder<T> {
-    fn default() -> Self {
-         Self::new()
-    }    
+unsafe impl<T> Send for ItemCounter<T> where T: Send {}
+
+impl<T> ItemCounter<T>  {
+    fn into_box(self) -> Box<Self> {
+        Box::new(self)
+    }
+}
+
+fn make_container<T>(item: T) -> ContainerType<T> {
+    // move the item to the heap via box
+    let boxed = ItemCounter {item, ref_counter: AtomicU32::new(0)}.into_box();
+    // get a pointer from the heap
+    NonNull::new(Box::into_raw(boxed)).expect("null ptr")
 }
 
 impl<T> RecyclerBuilder<T> {
-    pub fn new() -> Self {
-        RecyclerBuilder { contents: vec![] }
+    pub const fn new() -> Self {
+        Self { contents: vec![] }
     }
 
     /// moves a pre-constructed instance of T and makes it available in the recycler buffer when created
     pub fn push(mut self, item: T) -> Self {
-        // move the item to the heap via box
-        let boxed = Box::new(ItemHolder {item, ref_counter: AtomicU32::new(0)});
-
-        // get a pointer from the heap
-        self.contents.push(NonNull::new(Box::into_raw(boxed)).expect("null ptr"));
+        self.contents.push(make_container(item));
         Self {contents: self.contents}
     }
 
+
+    pub fn push_all<I>(mut self, items: I) -> Self where I: IntoIterator<Item = T>{
+        self.contents.extend(items.into_iter().map(|item| make_container(item)));
+        Self {contents: self.contents}
+    }
+
+    pub fn generate<GenFn>(self, count: usize, generator: GenFn) -> Self where GenFn: FnMut(usize) -> T{
+        self.push_all((0..count).map(generator))
+    }
+
     /// creates the recycler
-    pub fn build(self) -> Recycler<T> {
+    pub fn build(self) -> Recycler<DynamicBuffer<T>> {
 
         let contents = self.contents.into_boxed_slice();
 
         Recycler{
-            inner: RecyclerInnerType::new((
+            inner: DynamicBufferPtr::new((
                 Mutex::new(
-                    RecyclerInner{
+                    DynamicBuffer{
                         data: contents,
                         index: 0
                     }
@@ -60,75 +76,139 @@ impl<T> RecyclerBuilder<T> {
 }
 
 /// A buffer that manages the recycling of dropped items that were pulled from this buffer.
-pub struct Recycler<T> {
-    inner: RecyclerInnerType<T>
+pub struct Recycler<B> where B: RecyclerBuffer {
+    inner: Arc<(Mutex<B>, Condvar)>
 }
 
+pub trait RecyclerBuffer {
+    type ItemType;
+
+    fn recycle(&mut self, item: ContainerType<Self::ItemType>);
+    fn pop(&mut self) -> ContainerType<Self::ItemType>;
+    fn available(&self) -> usize;
+    fn empty(&self) -> bool;
+    fn capacity(&self) -> usize;
+}
+
+
 #[derive(Debug)]
-struct RecyclerInner<T> {    
-    data: Box<[ContentType<T>]>,
+pub struct DynamicBuffer<T>  {    
+    data: Box<[ContainerType<T>]>,
     index: usize,
 }
 
-impl<T> Drop for RecyclerInner<T> {
+unsafe impl<T> Send for DynamicBuffer<T> where T: Send {}
+
+impl<T> Drop for DynamicBuffer<T> {
     fn drop(&mut self) {
         // we have to manually drop each item in the buffer
-        for i in 0 ..self.data.len() {
-            let boxed = unsafe {Box::from_raw(self.data[i].as_ptr())};
-            drop(boxed)
-        }
+        self.data.iter().for_each(|item| unsafe{
+            drop(Box::from_raw(item.as_ptr()));
+        })
     }
 }
 
-impl<T> RecyclerInner<T> {
+#[derive(Debug)]
+pub struct StaticBuffer<T, const SIZE: usize> {
+    data: [ContainerType<T>; SIZE],
+    index: usize,
+}
+
+unsafe impl<T, const SIZE: usize> Send for StaticBuffer<T, SIZE> where T: Send {}
+
+impl<T, const SIZE: usize> Drop for StaticBuffer<T, SIZE> {
+    fn drop(&mut self) {
+        // we have to manually drop each item in the buffer
+        self.data.iter().for_each(|item| unsafe{
+            drop(Box::from_raw(item.as_ptr()));
+        })
+    }
+}
+
+impl<T> RecyclerBuffer for DynamicBuffer<T> {
+    type ItemType = T;
 
     #[inline]
-    fn recycle(&mut self, item: ContentType<T>) {
+    fn recycle(&mut self, item: ContainerType<T>) {
         self.index -= 1;
-        self.data[self.index] = item;
+        //*unsafe {self.data.get_unchecked_mut(self.index) } = item
+        self.data[self.index] = item
     }
 
     #[inline]
     /// takes an item from the internal buffer
-    fn pop(&mut self) -> ContentType<T>{
-        let item= self.data[self.index];        
+    fn pop(&mut self) -> ContainerType<T>{
+        //let item= unsafe {self.data.get_unchecked(self.index)};      
+        let item= self.data[self.index];      
         self.index += 1;
+        //*item
         item
+
     }
 
     #[inline]
-    fn available(&self) -> usize {
+    fn available(&self) -> usize { 
         self.data.len() - self.index
+    }
+
+    #[inline]
+    fn empty(&self) -> bool {
+        self.index == self.data.len()
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.data.len()
     }
 }
 
-impl <T> Recycler<T> {
+impl<T, const SIZE: usize> RecyclerBuffer for StaticBuffer<T, SIZE> {
+    type ItemType = T;
 
     #[inline]
-    fn make_ref(&self, item_ptr: ContentType<T>) -> RecycleRef<T> {
-        RecycleRef {
-            buf_ptr: self.inner.clone(),
-            item_ptr: item_ptr.as_ptr(),
-        }
+    fn recycle(&mut self, item: ContainerType<T>) {
+        self.index -= 1;
+        //*unsafe {self.data.get_unchecked_mut(self.index) } = item
+        self.data[self.index] = item
     }
 
-    pub fn take(&mut self)-> Option<RecycleRef<T>> {
-        let mut inner = self.inner.0.lock().unwrap();
-        if inner.index == inner.data.len(){
-            // empty
-            None
-        } else {
-            Some(self.make_ref(inner.pop()))
-        }
+    #[inline]
+    /// takes an item from the internal buffer
+    fn pop(&mut self) -> ContainerType<T>{
+        //let item= unsafe {self.data.get_unchecked(self.index)};      
+        let item= self.data[self.index];      
+        self.index += 1;
+        //*item
+        item
+
     }
 
+    #[inline]
+    fn available(&self) -> usize { 
+        self.data.len() - self.index
+    }
+
+    #[inline]
+    fn empty(&self) -> bool {
+        self.index == self.data.len()
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.data.len()
+    }
+
+}
+
+// enable share behavior if the buffer is +Send and the items in the buffer are +Send
+impl <B> Recycler<B> where B: RecyclerBuffer + Send{
     /// waits for an item to be available, runs the given function, and returns
     /// a shareable reference. This avoids an intermediate [RecycleRef] creation
     #[inline]
-    pub fn wait_and_share<F: FnOnce(&mut T)>(&mut self, f: F) -> SharedRecycleRef<T> {
+    pub fn wait_and_share<F>(&mut self, f: F) -> SharedRecycleRef<B> where <B as RecyclerBuffer>::ItemType: Send + Sync, F: FnOnce(&mut <B as RecyclerBuffer>::ItemType) {
         let mut inner = self.inner.0.lock().unwrap();
-        // while full wait until one is available
-        while inner.index == inner.data.len() {
+        // while empty wait until one is available
+        while inner.empty() {
             inner = self.inner.1.wait(inner).unwrap();
         }
             
@@ -141,13 +221,35 @@ impl <T> Recycler<T> {
         SharedRecycleRef::new(self.inner.clone(), ptr)
 
     } 
+}
+
+impl <B> Recycler<B> where B: RecyclerBuffer{
+
+    #[inline]
+    fn make_ref(&self, item_ptr: ContainerType<<B as RecyclerBuffer>::ItemType>) -> RecycleRef<B> {
+        RecycleRef {
+            buf_ptr: self.inner.clone(),
+            item_ptr: item_ptr.as_ptr(),
+        }
+    }
+
+    pub fn take(&mut self)-> Option<RecycleRef<B>> {
+        let mut inner = self.inner.0.lock().unwrap();
+        if inner.empty(){
+            // empty
+            None
+        } else {
+            Some(self.make_ref(inner.pop()))
+        }
+    }
+
 
     /// waits for one item to be available in the buffer. 
-    pub fn wait_and_take(&self)-> RecycleRef<T> {
+    pub fn wait_and_take(&self)-> RecycleRef<B> {
         let mut inner = self.inner.0.lock().unwrap();
 
         // loop until a new item is available
-        while inner.index == inner.data.len() {
+        while inner.empty() {
             inner = self.inner.1.wait(inner).unwrap();
         }
             
@@ -157,10 +259,9 @@ impl <T> Recycler<T> {
         self.make_ref(ptr)
     }
 
-    pub fn wait_for(&self, dur:  Duration) -> Option<RecycleRef<T>>  {
-        let inner = self.inner.0.lock().unwrap();
+    pub fn wait_for(&self, dur:  Duration) -> Option<RecycleRef<B>>  {
         // loop until one is available
-        if let Ok((mut inner, timeout)) = self.inner.1.wait_timeout_while(inner, dur, |e| {e.index == e.data.len()}) {
+        if let Ok((mut inner, timeout)) = self.inner.1.wait_timeout_while(self.inner.0.lock().unwrap(), dur, |e| {e.empty()}) {
             if !timeout.timed_out() {
                 // we didn't time out so at least one item is available
                 let ptr = inner.pop();
@@ -184,7 +285,7 @@ impl <T> Recycler<T> {
     /// returns the maximum number of items that can be stored in this recycler
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.inner.0.lock().unwrap().data.len()
+        self.inner.0.lock().unwrap().capacity()
     }
 
 
@@ -194,26 +295,25 @@ impl <T> Recycler<T> {
 /// When the reference is destroyed then the managed T instance will
 /// be recycled back into the [Recycler]. This reference is not thread safe
 /// but shareable thread safe references can be created by calling [RecycleRef::to_shared]
-pub struct RecycleRef<T> {
-    buf_ptr: RecyclerInnerType<T>,
-    item_ptr: * mut ItemHolder<T>,
+pub struct RecycleRef<B> where B: RecyclerBuffer{
+    buf_ptr: Arc<(Mutex<B>, Condvar)>,
+    item_ptr: * mut ItemCounter<B::ItemType>,
 }
 
-
-impl<T> RecycleRef<T> {
+impl<B> RecycleRef<B> where B: RecyclerBuffer + Send, B::ItemType: Send + Sync{
 
     /// consume this ref into a shareable form
-    pub fn to_shared(mut self) -> SharedRecycleRef<T> {
+    pub fn to_shared(mut self) -> SharedRecycleRef<B> {
 
-        let ptr = std::mem::replace(&mut self.item_ptr, std::ptr::null::<ItemHolder<T>>() as * mut ItemHolder<T>);
+        let ptr = std::mem::replace(&mut self.item_ptr, std::ptr::null::<ItemCounter<B::ItemType>>() as * mut ItemCounter<B::ItemType>);
         SharedRecycleRef::new(self.buf_ptr.clone(), NonNull::new(ptr).unwrap())
 
     }
-
+    
 }
 
-impl<T> Deref for RecycleRef<T> {
-    type Target = T;
+impl<B> Deref for RecycleRef<B> where B: RecyclerBuffer{
+    type Target = <B as RecyclerBuffer>::ItemType;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -224,7 +324,7 @@ impl<T> Deref for RecycleRef<T> {
     }
 }
 
-impl<T> DerefMut for RecycleRef<T> {
+impl<B> DerefMut for RecycleRef<B> where B: RecyclerBuffer {
 
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
@@ -234,42 +334,46 @@ impl<T> DerefMut for RecycleRef<T> {
     }
 }
 
-impl<T> Drop for RecycleRef<T> {
+impl<B> Drop for RecycleRef<B> where B: RecyclerBuffer{
     fn drop(&mut self) {
 
         if !self.item_ptr.is_null() {
             // we are the last reference remaining. We are now responsible for returning the
             // data to the main buffer
-            let mut inner = self.buf_ptr.0.lock().unwrap();
-            inner.recycle(NonNull::new(self.item_ptr).unwrap());
+            self.buf_ptr.0.lock().unwrap().recycle(NonNull::new(self.item_ptr).unwrap());
             self.buf_ptr.1.notify_one();
         }
 
     }
 }
 
+pub trait RecyclerRef<T>: Clone + Deref<Target = T> {}
+
+
 /// A thread safe recycle reference that allows read access to the underlying
 /// item. Once all instances of the shared recycle reference that contain the same
 /// item are drop then the item is recycled back into the recycler buffer. 
 #[derive(Debug)]
-pub struct SharedRecycleRef<T> {
-    buf_ptr: RecyclerInnerType<T>,
-    item_ptr: ContentType<T>,
+pub struct SharedRecycleRef<B> where B: RecyclerBuffer + Send, <B as RecyclerBuffer>::ItemType: Send + Sync{
+    buf_ptr: Arc<(Mutex<B>, Condvar)>,
+    item_ptr: ContainerType<<B as RecyclerBuffer>::ItemType>,
 }
 
-impl<T> SharedRecycleRef<T> {
+impl<B> SharedRecycleRef<B> where B: RecyclerBuffer + Send, <B as RecyclerBuffer>::ItemType: Send + Sync {
 
-    fn new(buf_ptr: RecyclerInnerType<T>, item_ptr: ContentType<T>) -> Self {
+    fn new(buf_ptr: Arc<(Mutex<B>, Condvar)>, item_ptr: ContainerType<<B as RecyclerBuffer>::ItemType>) -> Self {
         unsafe {item_ptr.as_ref()}.ref_counter.store(1, Ordering::Relaxed);
-        SharedRecycleRef { 
+        Self { 
             buf_ptr, 
             item_ptr, 
         }
     }
 }
 
-impl<T> Deref for SharedRecycleRef<T> {
-    type Target = T;
+// impl<B> RecyclerRef<B> for SharedRecycleRef<B> where B: RecyclerBuffer, <B as RecyclerBuffer>::ItemType: Send + Sync {}
+
+impl<B> Deref for SharedRecycleRef<B> where B: RecyclerBuffer + Send, <B as RecyclerBuffer>::ItemType: Send + Sync{
+    type Target = <B as RecyclerBuffer>::ItemType;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -279,13 +383,7 @@ impl<T> Deref for SharedRecycleRef<T> {
     }
 }
 
-impl<T> borrow::Borrow<T> for SharedRecycleRef<T> {
-    fn borrow(&self) -> &T {
-        self
-    }
-}
-
-impl<T> Clone for SharedRecycleRef<T> {
+impl<B> Clone for SharedRecycleRef<B> where B: RecyclerBuffer + Send, <B as RecyclerBuffer>::ItemType: Send + Sync{
 
     #[inline]
     fn clone(&self) -> Self {
@@ -297,11 +395,11 @@ impl<T> Clone for SharedRecycleRef<T> {
             std::process::abort();
         }
 
-        SharedRecycleRef { buf_ptr: self.buf_ptr.clone(), item_ptr: self.item_ptr}
+        Self { buf_ptr: self.buf_ptr.clone(), item_ptr: self.item_ptr}
     }
 }
 
-impl<T> Drop for SharedRecycleRef<T> {
+impl<B> Drop for SharedRecycleRef<B> where B: RecyclerBuffer + Send, <B as RecyclerBuffer>::ItemType: Send + Sync{
 
     #[inline]
     fn drop(&mut self) {
@@ -316,15 +414,14 @@ impl<T> Drop for SharedRecycleRef<T> {
 
         // we are the last reference remaining. We are now responsible for returning the
         // data to the recycler
-        let mut inner = self.buf_ptr.0.lock().unwrap();
-        inner.recycle(self.item_ptr);
+        self.buf_ptr.0.lock().unwrap().recycle(self.item_ptr);
         self.buf_ptr.1.notify_one();
 
     }
 }
 
-unsafe impl<T: Sync + Send> Send for SharedRecycleRef<T> {}
-unsafe impl<T: Sync + Send> Sync for SharedRecycleRef<T> {}
+unsafe impl<B> Send for SharedRecycleRef<B> where B: RecyclerBuffer + Send, <B as RecyclerBuffer>::ItemType: Send + Sync{}
+unsafe impl<B> Sync for SharedRecycleRef<B> where B: RecyclerBuffer + Send, <B as RecyclerBuffer>::ItemType: Send + Sync{}
 
 #[cfg(test)]
 mod tests {
@@ -337,7 +434,7 @@ mod tests {
     fn single_threaded() {
 
         type ItemType = RwLock<u32>;
-        
+                
         let mut recycler = RecyclerBuilder::<ItemType>::new()
             .push(ItemType::new(100))
             .push(ItemType::new(200))
@@ -373,7 +470,6 @@ mod tests {
 
     }
 
-
     #[tokio::test(flavor = "multi_thread")]
     async fn multi_threaded() {
         type ItemType = RwLock<Vec<u32>>;
@@ -384,7 +480,7 @@ mod tests {
             .push(ItemType::new(vec![1, 2, 3]))
             .build();
 
-        let (tx, rx) = tokio::sync::broadcast::channel::<SharedRecycleRef<ItemType>>(5);
+        let (tx, rx) = tokio::sync::broadcast::channel::<SharedRecycleRef<DynamicBuffer<ItemType>>>(5);
 
         let mut handles = vec![];
 
@@ -447,6 +543,9 @@ mod tests {
     async fn multi_threaded_strings() {
 
         use std::time::Instant;
+        use tokio::sync::broadcast::channel;
+
+        const CAPACITY: usize = 20;
 
         #[derive(Debug)]
         struct Item {
@@ -454,18 +553,45 @@ mod tests {
             count: u32
         }
 
-        let mut recycler = RecyclerBuilder::<Item>::new()
-        .push(Item {name: "Item".into(), count: 0})
-        .push(Item {name: "Item".into(), count: 0})
-        .push(Item {name: "Item".into(), count: 0})
-        .push(Item {name: "Item".into(), count: 0})
-        .push(Item {name: "Item".into(), count: 0})
-        .push(Item {name: "Item".into(), count: 0})
-        .push(Item {name: "Item".into(), count: 0})
-        .push(Item {name: "Item".into(), count: 0})
-        .push(Item {name: "Item".into(), count: 0})
-        .push(Item {name: "Item".into(), count: 0})
-        .build();
+        unsafe impl Send for Item {}
+
+        let fr = StaticBuffer::<Item, CAPACITY>{
+            data: [ 
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+                    make_container(Item{name: "Item".to_string(), count: 0}),
+
+                ], 
+            index: 0};
+
+        let mut recycler = Recycler::<StaticBuffer<Item, CAPACITY>>{
+            inner: StaticBufferPtr::new((
+                Mutex::new(fr), 
+                Condvar::new()
+            ))};
+
+        // let mut recycler = RecyclerBuilder::<Item>::new()
+        // .generate(CAPACITY, |_i| Item {name: "Item".into(), count: 0})
+        // .build();
+
+        assert!(recycler.capacity() == CAPACITY);
 
         let item = recycler.take().unwrap();
 
@@ -475,7 +601,8 @@ mod tests {
         // we took one item so check available is one less than capacity
         assert!(recycler.available() == recycler.capacity() -1 );
 
-        let (tx, rx) = tokio::sync::broadcast::channel::<SharedRecycleRef<Item>>(10);
+        let (tx, rx) = channel::<SharedRecycleRef<StaticBuffer<Item, CAPACITY>>>(CAPACITY);
+        //let (tx, rx) = channel::<SharedRecycleRef<DynamicBuffer<Item>>>(CAPACITY);
 
         let mut handles = vec![];
 
@@ -503,9 +630,11 @@ mod tests {
 
         let mut total_count_sent = vec![0u32; thread_count];
 
+        let iterations = 100000;
+
         drop(item);
         let start = Instant::now();
-        for round in 1 .. 50000 {
+        for round in 1 .. iterations {
             tx.send(recycler.wait_and_share(|item| {                
                 let id = round % thread_count;
                 item.name = id.to_string();
@@ -601,8 +730,9 @@ mod tests {
         let take_two = recycler.take().unwrap();
 
         assert!(*instance_counter.lock().unwrap() == recycler.capacity() as u32);
-
+        
         drop(take_one);
+        
         assert!(*instance_counter.lock().unwrap() == recycler.capacity() as u32);
 
         drop(take_two);

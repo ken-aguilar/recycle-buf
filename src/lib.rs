@@ -2,18 +2,21 @@
 //! by leveraging the Rust language's drop mechanics. The main motivation for this system is avoiding
 //! memory allocations of large and/or expensive to create objects in a realtime environment
 
-mod consumer;
+pub mod consumer;
+pub mod recycler;
 
-use consumer::{Consumer, ConsumerRef};
+mod sync_cell;
+
+
+use recycler::RecyclerBuffer;
+
 
 use std::{
-    ops::{Deref, DerefMut},
     ptr::NonNull,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc, Condvar, Mutex, Weak,
     },
-    time::Duration,
 };
 
 pub type GuardedBufferPtr<B> = Arc<BufferControl<B>>;
@@ -49,14 +52,6 @@ where
     }
 }
 
-/// Uses the builder pattern to pre allocate T instances
-/// and build the [Recycler]
-pub struct RecyclerBuilder<T>
-where
-    T: Send,
-{
-    contents: Vec<ContainerType<T>>,
-}
 
 pub struct ItemCounter<T> {
     ref_counter: AtomicU32,
@@ -81,86 +76,6 @@ impl<T> ItemCounter<T> {
     }
 }
 
-fn make_container<T>(item: T) -> ContainerType<T> {
-    // move the item to the heap via box
-    let boxed = ItemCounter {
-        item,
-        ref_counter: AtomicU32::new(0),
-    }
-    .into_box();
-    // get a pointer from the heap
-    Box::into_raw(boxed)
-}
-
-impl<T> RecyclerBuilder<T>
-where
-    T: Send + Sync,
-{
-    pub const fn new() -> Self {
-        Self { contents: vec![] }
-    }
-
-    /// moves a pre-constructed instance of T and makes it available in the recycler buffer when created
-    pub fn push(mut self, item: T) -> Self {
-        self.contents.push(make_container(item));
-        Self {
-            contents: self.contents,
-        }
-    }
-
-    pub fn push_all<I>(mut self, items: I) -> Self
-    where
-        I: IntoIterator<Item = T>,
-    {
-        self.contents
-            .extend(items.into_iter().map(|item| make_container(item)));
-        Self {
-            contents: self.contents,
-        }
-    }
-
-    pub fn generate<GenFn>(self, count: usize, generator: GenFn) -> Self
-    where
-        GenFn: FnMut(usize) -> T,
-    {
-        self.push_all((0..count).map(generator))
-    }
-
-    /// creates the recycler
-    pub fn build(self) -> Recycler<DynamicBuffer<T>> {
-        let contents = self.contents.into_boxed_slice();
-
-        Recycler::new(DynamicBufferPtr::new(BufferControl::new(
-            DynamicBuffer::new(contents),
-        )))
-    }
-}
-
-/// A buffer that manages the recycling of dropped items that were pulled from this buffer.
-pub struct Recycler<B>
-where
-    B: RecyclerBuffer,
-{
-    inner: GuardedBufferPtr<B>,
-}
-
-pub trait RecyclerBuffer {
-    
-    type ItemType;
-    const NullItem: * const ItemCounter<Self::ItemType> = std::ptr::null();
-
-    fn recycle(&mut self, item: NotNullItem<Self::ItemType>);
-    fn pop(&mut self) -> ContainerType<Self::ItemType>;
-    fn available(&self) -> usize;
-    fn empty(&self) -> bool;
-    fn capacity(&self) -> usize;
-    fn consumer_last_index(&self) -> usize;
-    fn consume_at(&self, index: usize) -> ContainerType<Self::ItemType>;
-    fn broadcast(&mut self) -> ContainerType<Self::ItemType>;
-    fn shutdown(&mut self);
-    fn increment_consumer_count(&mut self);
-    fn drop_consumer(&mut self);
-}
 
 #[derive(Debug)]
 pub struct DynamicBuffer<T> {
@@ -208,7 +123,7 @@ unsafe impl<T, const SIZE: usize> Send for StaticBuffer<T, SIZE> where T: Send {
 
 impl<T, const SIZE: usize> StaticBuffer<T, SIZE> {
     fn new(data: [ContainerType<T>; SIZE]) -> StaticBuffer<T, SIZE> {
-        let consumer_data = vec![Self::NullItem as ContainerType<T>; data.len() + 1];
+        let consumer_data = vec![Self::NULL_ITEM as ContainerType<T>; data.len() + 1];
 
         StaticBuffer {
             data,
@@ -364,7 +279,7 @@ impl<T, const SIZE: usize> RecyclerBuffer for StaticBuffer<T, SIZE> {
     #[inline]
     fn shutdown(&mut self) {
         let last_index = self.consumer_last_index();
-        self.consumer_data[last_index] = Self::NullItem as ContainerType<Self::ItemType>;
+        self.consumer_data[last_index] = Self::NULL_ITEM as ContainerType<Self::ItemType>;
 
         self.consumer_index += 1;
 
@@ -373,322 +288,24 @@ impl<T, const SIZE: usize> RecyclerBuffer for StaticBuffer<T, SIZE> {
         }
     }
 
+    #[inline]
     fn drop_consumer(&mut self) {
         self.consumer_count -= 1;
     }
 
+    #[inline]
     fn increment_consumer_count(&mut self) {
         self.consumer_count += 1;
     }
-}
-
-// enable share behavior if the buffer is +Send and the items in the buffer are +Send
-impl<B> Recycler<B>
-where
-    B: RecyclerBuffer + Send, <B as RecyclerBuffer>::ItemType: Send + Sync
-{
-    fn new(buf: GuardedBufferPtr<B>) -> Recycler<B> {
-        Recycler { inner: buf }
-    }
-    /// waits for an item to be available, runs the given function, and returns
-    /// a shareable reference. This avoids an intermediate [RecycleRef] creation
-    #[inline]
-    pub fn wait_and_share<F>(&mut self, f: F) -> SharedRecycleRef<B>
-    where
-        <B as RecyclerBuffer>::ItemType: Send + Sync,
-        F: FnOnce(&mut <B as RecyclerBuffer>::ItemType),
-    {
-        // while empty wait until one is available
-        let mut locked_buffer = self
-            .inner
-            .recycled_event
-            .wait_while(self.inner.buffer.lock().unwrap(), |b| b.empty())
-            .unwrap();
-        let mut ptr = NotNullItem::new(locked_buffer.pop()).unwrap();
-
-        f(unsafe { &mut ptr.as_mut().item });
-
-        SharedRecycleRef::new(self.inner.clone(), ptr)
-    }
-
-    #[inline]
-    pub fn wait_and_broadcast<F>(&mut self, f: F)
-    where
-        <B as RecyclerBuffer>::ItemType: Send + Sync,
-        F: FnOnce(&mut <B as RecyclerBuffer>::ItemType),
-    {
-        // while empty wait until one is available
-        let mut locked_buffer = self
-            .inner
-            .recycled_event
-            .wait_while(self.inner.buffer.lock().unwrap(), |b| b.empty())
-            .unwrap();
-        let mut ptr =  NotNullItem::new(locked_buffer.broadcast()).unwrap();
-
-        f(unsafe { &mut ptr.as_mut().item });
-
-        self.inner.item_produced_event.notify_all();
-    }
-
-    pub fn shutdown(&self) {
-        self.inner.buffer.lock().unwrap().shutdown();
-        self.inner.item_produced_event.notify_all();
-    }
-
-    pub fn create_consumer(&mut self) -> Consumer<B> {
-        let mut locked_buffer = self.inner.buffer.lock().unwrap();
-        locked_buffer.increment_consumer_count();
-
-        Consumer::new(
-            self.inner.clone(),
-            locked_buffer.consumer_last_index(),
-        )
-    }
-}
-
-impl<B> Recycler<B>
-where
-    B: RecyclerBuffer,
-{
-    #[inline]
-    fn make_ref(&self, item_ptr: NotNullItem<<B as RecyclerBuffer>::ItemType>) -> RecycleRef<B> {
-        RecycleRef {
-            buf_ptr: self.inner.clone(),
-            item_ptr: item_ptr.as_ptr(),
-        }
-    }
-
-    pub fn take(&mut self) -> Option<RecycleRef<B>> {
-        let mut inner = self.inner.buffer.lock().unwrap();
-        if inner.empty() {
-            // empty
-            None
-        } else {
-            Some(self.make_ref(NonNull::new(inner.pop()).unwrap()))
-        }
-    }
-
-    /// waits for one item to be available in the buffer.
-    pub fn wait_and_take(&self) -> RecycleRef<B> {
-        // loop while buffer is empty until at least one item becomes available
-        let mut locked_buffer = self
-            .inner
-            .recycled_event
-            .wait_while(self.inner.buffer.lock().unwrap(), |b| b.empty())
-            .unwrap();
-
-        let ptr = locked_buffer.pop();
-        drop(locked_buffer);
-
-        self.make_ref(NonNull::new(ptr).unwrap())
-    }
-
-    pub fn wait_for(&self, dur: Duration) -> Option<RecycleRef<B>> {
-        // loop until one is available
-        if let Ok((mut locked_buffer, timeout)) = self.inner.recycled_event.wait_timeout_while(
-            self.inner.buffer.lock().unwrap(),
-            dur,
-            |e| e.empty(),
-        ) {
-            if !timeout.timed_out() {
-                // we didn't time out so at least one item is available
-                let ptr = locked_buffer.pop();
-
-                // we don't need the lock any more so release it
-                drop(locked_buffer);
-
-                return Some( self.make_ref(NonNull::new(ptr).unwrap()));
-            }
-        }
-        None
-    }
-
-    /// returns the number of items currently available in the recycler. This
-    /// number can change any time after a call to this function in multithreaded scenarios.
-    #[inline]
-    pub fn available(&self) -> usize {
-        self.inner.buffer.lock().unwrap().available()
-    }
-
-    /// returns the maximum number of items that can be stored in this recycler
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        self.inner.buffer.lock().unwrap().capacity()
-    }
-}
-
-/// a reference to a managed T instance that allows mutation.
-/// When the reference is destroyed then the managed T instance will
-/// be recycled back into the [Recycler]. This reference is not thread safe
-/// but shareable thread safe references can be created by calling [RecycleRef::to_shared]
-pub struct RecycleRef<B>
-where
-    B: RecyclerBuffer,
-{
-    buf_ptr: GuardedBufferPtr<B>,
-    item_ptr: *mut ItemCounter<B::ItemType>,
-}
-
-impl<B> RecycleRef<B>
-where
-    B: RecyclerBuffer + Send,
-    B::ItemType: Send + Sync,
-{
-    /// consume this ref into a shareable form
-    pub fn to_shared(mut self) -> SharedRecycleRef<B> {
-        let ptr = std::mem::replace(
-            &mut self.item_ptr,
-            std::ptr::null::<ItemCounter<B::ItemType>>() as *mut ItemCounter<B::ItemType>,
-        );
-        SharedRecycleRef::new(self.buf_ptr.clone(), NonNull::new(ptr).unwrap())
-    }
-}
-
-impl<B> Deref for RecycleRef<B>
-where
-    B: RecyclerBuffer,
-{
-    type Target = <B as RecyclerBuffer>::ItemType;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        // item ptr is only null after consumed by to_shared
-        unsafe { &self.item_ptr.as_ref().unwrap().item }
-    }
-}
-
-impl<B> DerefMut for RecycleRef<B>
-where
-    B: RecyclerBuffer,
-{
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut self.item_ptr.as_mut().unwrap().item }
-    }
-}
-
-impl<B> Drop for RecycleRef<B>
-where
-    B: RecyclerBuffer,
-{
-    fn drop(&mut self) {
-        if !self.item_ptr.is_null() {
-            // we are the last reference remaining. We are now responsible for returning the
-            // data to the main buffer
-            self.buf_ptr
-                .buffer
-                .lock()
-                .unwrap()
-                .recycle(NonNull::new(self.item_ptr).unwrap());
-            self.buf_ptr.recycled_event.notify_one();
-        }
-    }
-}
-
-pub trait RecyclerRef<T>: Clone + Deref<Target = T> {}
-
-/// A thread safe recycle reference that allows read access to the underlying
-/// item. Once all instances of the shared recycle reference that contain the same
-/// item are drop then the item is recycled back into the recycler buffer.
-#[derive(Debug)]
-pub struct SharedRecycleRef<B>
-where
-    B: RecyclerBuffer + Send,
-    <B as RecyclerBuffer>::ItemType: Send + Sync,
-{
-    buf_ptr: GuardedBufferPtr<B>,
-    item_ptr: NotNullItem<<B as RecyclerBuffer>::ItemType>,
-}
-
-impl<B> SharedRecycleRef<B>
-where
-    B: RecyclerBuffer + Send,
-    <B as RecyclerBuffer>::ItemType: Send + Sync,
-{
-    fn new(
-        buf_ptr: GuardedBufferPtr<B>,
-        item_ptr: NotNullItem<<B as RecyclerBuffer>::ItemType>,
-    ) -> Self {
-        unsafe { item_ptr.as_ref() }
-            .ref_counter
-            .store(1, Ordering::Relaxed);
-        Self { buf_ptr, item_ptr }
-    }
-}
-
-// impl<B> RecyclerRef<B> for SharedRecycleRef<B> where B: RecyclerBuffer, <B as RecyclerBuffer>::ItemType: Send + Sync {}
-
-impl<B> Deref for SharedRecycleRef<B>
-where
-    B: RecyclerBuffer + Send,
-    <B as RecyclerBuffer>::ItemType: Send + Sync,
-{
-    type Target = <B as RecyclerBuffer>::ItemType;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        unsafe { &self.item_ptr.as_ref().item }
-    }
-}
-
-impl<B> Clone for SharedRecycleRef<B>
-where
-    B: RecyclerBuffer + Send,
-    <B as RecyclerBuffer>::ItemType: Send + Sync,
-{
-    #[inline]
-    fn clone(&self) -> Self {
-        let old_rc = unsafe { self.item_ptr.as_ref().increment() };
-
-        if old_rc >= isize::MAX as u32 {
-            std::process::abort();
-        }
-
-        Self {
-            buf_ptr: self.buf_ptr.clone(),
-            item_ptr: self.item_ptr,
-        }
-    }
-}
-
-impl<B> Drop for SharedRecycleRef<B>
-where
-    B: RecyclerBuffer + Send,
-    <B as RecyclerBuffer>::ItemType: Send + Sync,
-{
-    #[inline]
-    fn drop(&mut self) {
-        let ptr = self.item_ptr;
-        let value = unsafe { ptr.as_ref() }.decrement();
-
-        if value != 1 {
-            return;
-        }
-        // previous value was 1 one and after decrementing the counter we are now at zero
-        // we are the last reference remaining. We are now responsible for returning the
-        // data to the recycler
-        self.buf_ptr.buffer.lock().unwrap().recycle(ptr);
-        self.buf_ptr.recycled_event.notify_one();
-    }
-}
-
-unsafe impl<B> Send for SharedRecycleRef<B>
-where
-    B: RecyclerBuffer + Send,
-    <B as RecyclerBuffer>::ItemType: Send + Sync,
-{
-}
-unsafe impl<B> Sync for SharedRecycleRef<B>
-where
-    B: RecyclerBuffer + Send,
-    <B as RecyclerBuffer>::ItemType: Send + Sync,
-{
 }
 
 #[cfg(test)]
 mod tests {
 
     use std::sync::RwLock;
+    use std::time::Duration;
+
+    use crate::recycler::{make_container, Recycler, RecyclerBuilder, SharedRecycleRef};
 
     use super::*;
 
@@ -748,7 +365,7 @@ mod tests {
         // this rx is never used but will keep any items sent on the channel from being dropped so we need to drop it
         drop(rx);
 
-        for id in 0..5 {
+        for _id in 0..5 {
             let mut thread_recv = tx.subscribe();
             handles.push(tokio::task::spawn(async move {
                 while let Ok(item) = thread_recv.recv().await {
@@ -794,8 +411,205 @@ mod tests {
         println!("tests complete")
     }
 
+    #[ignore = "crashing"]
+    #[test]
+    fn multi_threaded_strings_crossbeam() {
+        use std::time::Instant;
+        use crossbeam::channel;
+
+        const CAPACITY: usize = 20;
+
+        #[derive(Debug)]
+        struct Item {
+            name: String,
+            count: usize,
+        }
+
+        unsafe impl Send for Item {}
+
+        let fr = StaticBuffer::<Item, CAPACITY>::new([
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+            make_container(Item {
+                name: "Item".to_string(),
+                count: 0,
+            }),
+        ]);
+
+        let mut recycler = Recycler::<StaticBuffer<Item, CAPACITY>>::new(StaticBufferPtr::new(
+            BufferControl::new(fr),
+        ));
+
+        // let mut recycler = RecyclerBuilder::<Item>::new()
+        // .generate(CAPACITY, |_i| Item {name: "Item".into(), count: 0})
+        // .build();
+
+        assert!(recycler.capacity() == CAPACITY);
+
+        let item = recycler.take().unwrap();
+
+        assert!(item.name == "Item");
+        assert!(item.count == 0);
+
+        // we took one item so check available is one less than capacity
+        assert!(recycler.available() == recycler.capacity() - 1);
+
+        let (tx, rx) = channel::bounded::<SharedRecycleRef<StaticBuffer<Item, CAPACITY>>>(CAPACITY);
+
+        let mut handles = vec![];
+
+        // this rx is never used but will keep any items sent on the channel from being dropped so we need to drop it
+
+        let thread_count = 20;
+        for id in 0..thread_count {
+            let thread_recv = rx.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut count = 0usize;
+                let my_name = id.to_string();
+                let mut total_events = 0usize;
+
+                while let Ok(item) = thread_recv.recv() {
+                    total_events += 1;
+                    if item.name == my_name {
+                        if item.count != total_events {
+                            println!("err: event #{total_events}, count was {}", item.count);
+                        }
+                        //println!("thread {} adding {} to {}", my_name, item.count, count);
+                        count += item.count as usize;
+                    }
+                }
+
+                (id, count, total_events)
+            }));
+        }
+        drop(rx);
+
+
+        let mut total_count_sent = vec![0usize; thread_count];
+
+        let iterations = 100000;
+
+        drop(item);
+        let start = Instant::now();
+        for round in 1..iterations {
+            tx.send(recycler.wait_and_share(|item| {
+                let id = round % thread_count;
+                item.name = id.to_string();
+                item.count = round as usize;
+                total_count_sent[id] += round as usize;
+            }))
+            .unwrap();
+        }
+
+        // should cause threads leave their loop when the tx end is dropped
+        drop(tx);
+
+        let mut results = vec![];
+
+        for result in handles.into_iter() {
+            results.push(result.join());
+        }
+
+        let elapse = start.elapsed();
+        println!("test completed in {:.2}s", elapse.as_secs_f32());
+        println!("Waiting for threads");
+        for result in results.into_iter() {
+            match result {
+                Ok((id, value, total_events)) => {
+                    let expected = total_count_sent[id];
+                    println!("thread {} expecting {} and had {} total_events", id, expected, total_events);
+                    assert!(
+                        value == expected,
+                        "thread {id}, expected {expected} but got {value}"
+                    );
+                    assert!(total_events == (iterations -1));
+                }
+                Err(e) => {
+                    eprintln!("Error: {e:?}");
+                }
+            }
+        }
+
+        println!("test completed in {:.2}s", elapse.as_secs_f32());
+    }
+
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn multi_threaded_strings() {
+    async fn multi_threaded_strings_tokio() {
         use std::time::Instant;
         use tokio::sync::broadcast::channel;
 
@@ -968,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_threaded_strings2() {
+    fn multi_threaded_strings_custom() {
         use std::time::Instant;
 
         const CAPACITY: usize = 20;
@@ -978,8 +792,6 @@ mod tests {
             name: String,
             count: usize,
         }
-
-        unsafe impl Send for Item {}
 
         let fr = StaticBuffer::<Item, CAPACITY>::new([
             make_container(Item {

@@ -13,6 +13,7 @@ edition = "2021"
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 futures = "0"
+crossbeam = "0"
 
 [dependencies]
 bit-set = "0.5.3"

@@ -1,8 +1,6 @@
 use std::{ptr::NonNull, ops::Deref};
 
-use crate::{RecyclerBuffer, GuardedBufferPtr, ContainerType, NotNullItem};
-
-
+use crate::buffer::{RecyclerBuffer, GuardedBufferPtr, NotNullItem};
 
 
 pub struct Consumer<B>

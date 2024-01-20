@@ -1,12 +1,20 @@
-use std::{sync::atomic::{AtomicU32, Ordering}, ptr::NonNull, time::Duration, ops::{Deref, DerefMut}};
+use std::{ptr::NonNull, time::Duration};
 
-use crate::{consumer::Consumer, buffer::{RecyclerBuffer, NotNullItem, ContainerType, RecycleRef, make_container, BufferControl, SharedRecycleRef, GuardedBufferPtr, DynamicBufferPtr, DynamicBuffer}};
-
+use crate::{
+    buffer::{
+        make_container, ContainerType, DynamicBuffer, DynamicBufferPtr, GuardedBufferPtr,
+        NotNullItem, ProducerConsumerBuffer, RecycleRef, RecyclerBuffer, SharedRecycleRef,
+        StackBuffer,
+    },
+    consumer::Consumer,
+    sync_cell::SyncUnsafeCell,
+};
 
 /// A buffer that manages the recycling of dropped items that were pulled from this buffer.
 pub struct Recycler<B>
 where
     B: RecyclerBuffer,
+    <B as RecyclerBuffer>::ItemType: Send + Sync,
 {
     inner: GuardedBufferPtr<B>,
 }
@@ -14,11 +22,35 @@ where
 // enable share behavior if the buffer is +Send and the items in the buffer are +Send
 impl<B> Recycler<B>
 where
-    B: RecyclerBuffer + Send, <B as RecyclerBuffer>::ItemType: Send + Sync
+    B: RecyclerBuffer + Send,
+    <B as RecyclerBuffer>::ItemType: Send + Sync,
 {
-    pub fn new(buf: GuardedBufferPtr<B>) -> Recycler<B> {
-        Recycler { inner: buf }
+    pub fn new(buf: GuardedBufferPtr<B>) -> Self {
+        Self { inner: buf }
     }
+
+    /// returns the number of items currently available in the recycler. This
+    /// number can change any time after a call to this function in multithreaded scenarios.
+    #[inline]
+    pub fn available(&self) -> usize {
+        self.inner.get().available()
+    }
+
+    /// returns the maximum number of items that can be stored in this recycler
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.inner.get().capacity()
+    }
+
+
+}
+
+// recycler capabilities for when the underlying buffer implements StackBuffer
+impl<B> Recycler<B>
+where
+    B: StackBuffer + Send,
+    <B as RecyclerBuffer>::ItemType: Send + Sync,
+{
     /// waits for an item to be available, runs the given function, and returns
     /// a shareable reference. This avoids an intermediate [RecycleRef] creation
     #[inline]
@@ -27,122 +59,63 @@ where
         <B as RecyclerBuffer>::ItemType: Send + Sync,
         F: FnOnce(&mut <B as RecyclerBuffer>::ItemType),
     {
-        // while empty wait until one is available
-        let mut locked_buffer = self
-            .inner
-            .recycled_event
-            .wait_while(self.inner.buffer.lock().unwrap(), |b| b.empty())
-            .unwrap();
-        let mut ptr = NotNullItem::new(locked_buffer.pop()).unwrap();
+        let mut ptr = NotNullItem::new(self.inner.get().wait_for_one().cast_mut()).unwrap();
 
         f(unsafe { &mut ptr.as_mut().item });
 
         SharedRecycleRef::new(self.inner.clone(), ptr)
     }
 
+    pub fn take(&mut self) -> Option<RecycleRef<B>> {
+        self.inner
+            .get()
+            .get_one()
+            .map(|i| self.make_ref(NonNull::new(i.cast_mut()).unwrap()))
+    }
+
+    /// waits for one item to be available in the buffer.
+    pub fn wait_and_take(&self) -> RecycleRef<B> {
+        let ptr = self.inner.get().wait_for_one();
+
+        self.make_ref(NonNull::new(ptr.cast_mut()).unwrap())
+    }
+    pub fn wait_for(&self, dur: Duration) -> Option<RecycleRef<B>> {
+        // loop until one is available
+        self.inner
+            .get()
+            .timed_wait_for_one(dur)
+            .and_then(|item| Some(self.make_ref(NonNull::new(item.cast_mut()).unwrap())))
+    }
+
+    #[inline]
+    fn make_ref(&self, item_ptr: NotNullItem<<B as RecyclerBuffer>::ItemType>) -> RecycleRef<B> {
+        RecycleRef::new(self.inner.clone(), item_ptr)
+    }
+}
+
+impl<B> Recycler<B>
+where
+    B: ProducerConsumerBuffer + Send,
+    <B as RecyclerBuffer>::ItemType: Send + Sync,
+{
     #[inline]
     pub fn wait_and_broadcast<F>(&mut self, f: F)
     where
         <B as RecyclerBuffer>::ItemType: Send + Sync,
         F: FnOnce(&mut <B as RecyclerBuffer>::ItemType),
     {
-        // while empty wait until one is available
-        let mut locked_buffer = self
-            .inner
-            .recycled_event
-            .wait_while(self.inner.buffer.lock().unwrap(), |b| b.empty())
-            .unwrap();
-        let mut ptr =  NotNullItem::new(locked_buffer.broadcast()).unwrap();
-
-        f(unsafe { &mut ptr.as_mut().item });
-
-        self.inner.item_produced_event.notify_all();
-    }
-
-    pub fn shutdown(&self) {
-        self.inner.buffer.lock().unwrap().shutdown();
-        self.inner.item_produced_event.notify_all();
+        self.inner.get().broadcast(f);
     }
 
     pub fn create_consumer(&mut self) -> Consumer<B> {
-        let mut locked_buffer = self.inner.buffer.lock().unwrap();
-        locked_buffer.increment_consumer_count();
-
         Consumer::new(
             self.inner.clone(),
-            locked_buffer.consumer_last_index(),
-        )
-    }
-}
-
-impl<B> Recycler<B>
-where
-    B: RecyclerBuffer + Send, <B as RecyclerBuffer>::ItemType: Send + Sync
-{
-    #[inline]
-    fn make_ref(&self, item_ptr: NotNullItem<<B as RecyclerBuffer>::ItemType>) -> RecycleRef<B> {
-        RecycleRef::new(
-            self.inner.clone(),
-            item_ptr,
+            self.inner.get().increment_consumer_count(),
         )
     }
 
-    pub fn take(&mut self) -> Option<RecycleRef<B>> {
-        let mut inner = self.inner.buffer.lock().unwrap();
-        if inner.empty() {
-            // empty
-            None
-        } else {
-            Some(self.make_ref(NonNull::new(inner.pop()).unwrap()))
-        }
-    }
-
-    /// waits for one item to be available in the buffer.
-    pub fn wait_and_take(&self) -> RecycleRef<B> {
-        // loop while buffer is empty until at least one item becomes available
-        let mut locked_buffer = self
-            .inner
-            .recycled_event
-            .wait_while(self.inner.buffer.lock().unwrap(), |b| b.empty())
-            .unwrap();
-
-        let ptr = locked_buffer.pop();
-        drop(locked_buffer);
-
-        self.make_ref(NonNull::new(ptr).unwrap())
-    }
-
-    pub fn wait_for(&self, dur: Duration) -> Option<RecycleRef<B>> {
-        // loop until one is available
-        if let Ok((mut locked_buffer, timeout)) = self.inner.recycled_event.wait_timeout_while(
-            self.inner.buffer.lock().unwrap(),
-            dur,
-            |e| e.empty(),
-        ) {
-            if !timeout.timed_out() {
-                // we didn't time out so at least one item is available
-                let ptr = locked_buffer.pop();
-
-                // we don't need the lock any more so release it
-                drop(locked_buffer);
-
-                return Some( self.make_ref(NonNull::new(ptr).unwrap()));
-            }
-        }
-        None
-    }
-
-    /// returns the number of items currently available in the recycler. This
-    /// number can change any time after a call to this function in multithreaded scenarios.
-    #[inline]
-    pub fn available(&self) -> usize {
-        self.inner.buffer.lock().unwrap().available()
-    }
-
-    /// returns the maximum number of items that can be stored in this recycler
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        self.inner.buffer.lock().unwrap().capacity()
+    pub fn shutdown(&self) {
+        self.inner.get().shutdown();
     }
 }
 
@@ -154,7 +127,6 @@ where
 {
     contents: Vec<ContainerType<T>>,
 }
-
 
 impl<T> RecyclerBuilder<T>
 where
@@ -194,7 +166,7 @@ where
     pub fn build(self) -> Recycler<DynamicBuffer<T>> {
         let contents = self.contents.into_boxed_slice();
 
-        Recycler::new(DynamicBufferPtr::new(BufferControl::new(
+        Recycler::new(DynamicBufferPtr::new(SyncUnsafeCell::new(
             DynamicBuffer::new(contents),
         )))
     }

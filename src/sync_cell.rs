@@ -1,19 +1,22 @@
 use std::cell::UnsafeCell;
 
+#[derive(Debug)]
 #[repr(transparent)]
 pub struct SyncUnsafeCell<T: ?Sized> {
-    value: T,
+    value: UnsafeCell<T>,
 }
 
 unsafe impl<T: ?Sized + Sync> Sync for SyncUnsafeCell<T> {}
+unsafe impl<T: ?Sized + Send> Send for SyncUnsafeCell<T> {}
 
 impl<T> SyncUnsafeCell<T> {
     /// Constructs a new instance of `SyncUnsafeCell` which will wrap the specified value.
     #[inline]
     pub const fn new(value: T) -> Self {
-        Self { value }
+        Self {
+            value: UnsafeCell::new(value),
+        }
     }
-
 }
 
 impl<T: ?Sized> SyncUnsafeCell<T> {
@@ -24,17 +27,8 @@ impl<T: ?Sized> SyncUnsafeCell<T> {
     /// when casting to `&mut T`, and ensure that there are no mutations
     /// or mutable aliases going on when casting to `&T`
     #[inline]
-    pub const fn get(&self) -> *mut T {
-        self as *const SyncUnsafeCell<T> as *const T as *mut T
-    }
-
-    /// Returns a mutable reference to the underlying data.
-    ///
-    /// This call borrows the `SyncUnsafeCell` mutably (at compile-time) which
-    /// guarantees that we possess the only reference.
-    #[inline]
-    pub fn get_mut(&mut self) -> &mut T {
-        &mut self.value
+    pub fn get(&self) -> &mut T {
+        unsafe { self.value.get().as_mut().unwrap() }
     }
 
     /// Gets a mutable pointer to the wrapped value.

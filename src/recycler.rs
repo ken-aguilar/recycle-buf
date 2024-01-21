@@ -110,7 +110,7 @@ where
     pub fn create_consumer(&mut self) -> Consumer<B> {
         Consumer::new(
             self.inner.clone(),
-            self.inner.get().increment_consumer_count(),
+            self.inner.get().consume_start(),
         )
     }
 

@@ -5,8 +5,9 @@
 pub mod buffer;
 pub mod consumer;
 pub mod recycler;
+pub mod sync_cell;
 
-mod sync_cell;
+mod ordering;
 
 #[cfg(test)]
 mod tests {
@@ -443,6 +444,7 @@ mod tests {
                             count += item.count;
                         }
                     }) {
+                        println!("thread stopping!!");
                         break;
                     }
                 }

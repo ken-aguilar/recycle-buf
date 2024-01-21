@@ -23,6 +23,7 @@ where
     B: ProducerConsumerBuffer + Send,
     <B as RecyclerBuffer>::ItemType: Send + Sync,
 {
+
     pub fn new(buf_ptr: GuardedBufferPtr<B>, consumer_index: usize) -> Self {
         Self {
             buf_ptr,
@@ -32,7 +33,7 @@ where
 
     #[inline]
     pub fn next(&mut self) -> Option<ConsumerRef<B>> {
-        let item_counter_ptr = self.buf_ptr.get().consume_at(&mut self.consumer_index);
+        let (item_counter_ptr, recycle_to) = self.buf_ptr.get().consume_at(&mut self.consumer_index);
 
         if item_counter_ptr.is_null() {
             return None;
@@ -41,6 +42,7 @@ where
         Some(ConsumerRef {
             consumer: self,
             item_ptr: unsafe { NonNull::new_unchecked(item_counter_ptr.cast_mut()) },
+            recycle_to
         })
     }
 
@@ -49,7 +51,7 @@ where
     where
         F: FnOnce(&<B as RecyclerBuffer>::ItemType),
     {
-        let item_counter_ptr = self.buf_ptr.get().consume_at(&mut self.consumer_index);
+        let (item_counter_ptr, recycle_to) = self.buf_ptr.get().consume_at(&mut self.consumer_index);
 
         if item_counter_ptr.is_null() {
             return false;
@@ -57,14 +59,14 @@ where
         let item_counter = unsafe { item_counter_ptr.as_ref().unwrap() };
         f(&item_counter.item);
 
-        if item_counter.decrement() == 1 {
-            unsafe {
-                self.buf_ptr
-                    .get()
-                    .recycle(NonNull::new_unchecked(item_counter_ptr.cast_mut()));
-            }
+        let left = item_counter.decrement();
+        println!("consumed item at {recycle_to}, count left is {}", left - 1);
+        if left == 1 {
+            println!("attempting to reycle to {recycle_to}");
+            self.buf_ptr
+            .get()
+            .recycle(recycle_to);
         }
-
         true
     }
 }
@@ -76,6 +78,7 @@ where
 {
     consumer: &'a Consumer<B>,
     item_ptr: NotNullItem<<B as RecyclerBuffer>::ItemType>,
+    recycle_to: usize
 }
 
 impl<'a, B> Deref for ConsumerRef<'a, B>
@@ -100,7 +103,7 @@ where
         let mut ptr = self.item_ptr;
         if unsafe { ptr.as_mut().decrement() } == 1 {
             // we last
-            self.consumer.buf_ptr.get().recycle(ptr);
+            self.consumer.buf_ptr.get().recycle(self.recycle_to);
         }
     }
 }

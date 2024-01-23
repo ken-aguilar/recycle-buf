@@ -136,6 +136,7 @@ mod tests {
             TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0
             }
         }).build();
 
@@ -246,6 +247,7 @@ mod tests {
             TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0
             }
         }).build();
         assert!(recycler.capacity() == CAPACITY);
@@ -285,7 +287,7 @@ mod tests {
 
         let mut total_count_sent = vec![0usize; thread_count];
 
-        let iterations = 100_000;
+        let iterations = 200_000;
 
         drop(item);
         let start = Instant::now();
@@ -315,12 +317,82 @@ mod tests {
         println!("test completed in {:.2}s", elapse.as_secs_f32());
     }
 
-    #[derive(Debug)]
+    #[ignore = "reason"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multi_threaded_strings_tokio_no_rec() {
+        use std::time::Instant;
+        use tokio::sync::broadcast::channel;
+
+        const CAPACITY: usize = 200;
+
+
+        let (tx, rx) = channel::<TestItem>(CAPACITY);
+
+        let mut handles = vec![];
+
+        
+        let thread_count = 20;
+        let barrier = Arc::new(tokio::sync::Barrier::new(thread_count+1));
+        for id in 0..thread_count {
+            let bar = barrier.clone();
+
+            let mut thread_recv = tx.subscribe();
+            handles.push(tokio::task::spawn(async move {
+                bar.wait().await;
+                let mut count = 0usize;
+                let my_name = id.to_string();
+                
+                while let Ok(item) = thread_recv.recv().await {
+                    if item.name == my_name {
+                        count += item.count;
+                    }
+                }
+                
+                (id, count)
+            }));
+        }
+        // this rx is never used but will keep any items sent on the channel from being dropped so we need to drop it
+        drop(rx);
+
+        let mut total_count_sent = vec![0usize; thread_count];
+
+        let iterations = 200_000;
+
+        let start = Instant::now();
+        barrier.wait().await;
+        for round in 1..iterations {
+            let id = round % thread_count;
+            tx.send(TestItem {
+                name: id.to_string(),
+                count: round as usize,
+                sent: 0
+            }).unwrap();         
+            tokio::time::sleep(Duration::from_micros(500)).await;
+            total_count_sent[id] += round as usize;
+        }
+
+        // should cause threads leave their loop when the tx end is dropped
+        drop(tx);
+
+        let results = futures::future::try_join_all(handles).await;
+        let elapse = start.elapsed();
+
+        assert!(results.is_ok());
+
+        for result in results.ok().unwrap() {
+            //println!("thread {} returning {}", result.0, result.1);
+            assert!(result.1 == total_count_sent[result.0]);
+        }
+
+        println!("test completed in {:.2}s", elapse.as_secs_f32());
+    }
+
+    #[derive(Debug, Clone)]
     struct TestItem {
         name: String,
         count: usize,
+        sent: usize
     }
-
     fn setup() -> Recycler::<StaticBuffer<TestItem, 20>>{
         const CAPACITY: usize = 20;
 
@@ -328,82 +400,121 @@ mod tests {
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
+
             }),
             make_container(TestItem {
                 name: "Item".to_string(),
                 count: 0,
+                sent: 0,
             }),
         ]);
         Recycler::<StaticBuffer<TestItem, CAPACITY>>::new(StaticBufferPtr::new(
@@ -425,26 +536,29 @@ mod tests {
         let mut handles = vec![];
 
         let thread_count = 20;
+        let barrier = Arc::new(std::sync::Barrier::new(thread_count+1));
+
         for id in 0..thread_count {
             let mut consumer = recycler.create_consumer();
-
+            let b = barrier.clone();
             handles.push(std::thread::spawn(move || {
                 let mut count = 0usize;
                 let my_name = id.to_string();
                 let mut total_events = 0;
-
+            //   b.wait();
                 loop {
                     if !consumer.next_fn(|item| {
                         total_events += 1;
                         if item.name == my_name {
                             // if item.count != total_events {
-                            //     println!("err: event #{total_events}, count was {}", item.count);
+                            //     println!("{:?}: err: event #{total_events}, count was {}", std::thread::current().id(), item.count);
+                            //     panic!("bailing");
                             // }
-                            // println!("thread {} adding {} to {}", my_name, item.count, count);
+                            //println!("thread {} adding {} to {}", my_name, item.count, count);
                             count += item.count;
                         }
                     }) {
-                        println!("thread stopping!!");
+                        // println!("thread stopping!!");
                         break;
                     }
                 }
@@ -453,9 +567,11 @@ mod tests {
             }));
         }
 
+// barrier.wait();
+
         let mut total_count_sent = vec![0usize; thread_count];
 
-        let iterations = 100_000;
+        let iterations = 200_000;
 
         let start = Instant::now();
         for round in 1..iterations {
@@ -468,6 +584,7 @@ mod tests {
         }
 
         recycler.shutdown();
+
         let mut results = vec![];
 
         for result in handles.into_iter() {
@@ -481,7 +598,7 @@ mod tests {
             match result {
                 Ok((id, value, total_events)) => {
                     let expected = total_count_sent[id];
-                    //println!("thread {} expecting {} and had {} total_events", id, expected, total_events);
+                   // println!("thread {} expecting {}, got {} and had {} total_events", id, expected, value, total_events);
                     assert!(
                         value == expected,
                         "thread {id}, expected {expected} but got {value}"

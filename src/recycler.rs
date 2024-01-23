@@ -29,17 +29,10 @@ where
         Self { inner: buf }
     }
 
-    /// returns the number of items currently available in the recycler. This
-    /// number can change any time after a call to this function in multithreaded scenarios.
-    #[inline]
-    pub fn available(&self) -> usize {
-        self.inner.get().available()
-    }
-
     /// returns the maximum number of items that can be stored in this recycler
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.inner.get().capacity()
+        self.inner.get().capacity() as usize
     }
 
 
@@ -64,6 +57,13 @@ where
         f(unsafe { &mut ptr.as_mut().item });
 
         SharedRecycleRef::new(self.inner.clone(), ptr)
+    }
+
+    /// returns the number of items currently available in the recycler. This
+    /// number can change any time after a call to this function in multithreaded scenarios.
+    #[inline]
+    pub fn available(&self) -> usize {
+        self.inner.get().available() as usize
     }
 
     pub fn take(&mut self) -> Option<RecycleRef<B>> {
@@ -108,11 +108,15 @@ where
     }
 
     pub fn create_consumer(&mut self) -> Consumer<B> {
-        Consumer::new(
+        let mut new_consumer = Consumer::new(
             self.inner.clone(),
-            self.inner.get().consume_start(),
-        )
+        );
+        self.inner.get().add_consumer(&mut new_consumer);
+
+        new_consumer
+
     }
+
 
     pub fn shutdown(&self) {
         self.inner.get().shutdown();

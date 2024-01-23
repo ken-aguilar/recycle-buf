@@ -31,6 +31,11 @@ impl<T: ?Sized> SyncUnsafeCell<T> {
         unsafe { self.value.get().as_mut().unwrap() }
     }
 
+    #[inline]
+    pub fn get_mut(&self) -> &mut T {
+        unsafe { self.value.get().as_mut().unwrap() }
+    }
+
     /// Gets a mutable pointer to the wrapped value.
     ///
     /// See [`UnsafeCell::get`] for details.

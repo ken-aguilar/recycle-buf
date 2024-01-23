@@ -1,14 +1,14 @@
 use std::{ops::Deref, ptr::NonNull};
 
-use crate::buffer::{GuardedBufferPtr, NotNullItem, ProducerConsumerBuffer, RecyclerBuffer};
+use crate::{buffer::{GuardedBufferPtr, NotNullItem, ProducerConsumerBuffer, RecyclerBuffer}, ordering::ConsumerState};
 
-pub struct Consumer<B>
+pub(crate) struct Consumer<B>
 where
     B: ProducerConsumerBuffer + Send,
     <B as RecyclerBuffer>::ItemType: Send + Sync,
 {
     buf_ptr: GuardedBufferPtr<B>,
-    consumer_index: usize,
+    consumer_counter: usize
 }
 
 unsafe impl<B> Send for Consumer<B>
@@ -24,16 +24,18 @@ where
     <B as RecyclerBuffer>::ItemType: Send + Sync,
 {
 
-    pub fn new(buf_ptr: GuardedBufferPtr<B>, consumer_index: usize) -> Self {
+    pub fn new(buf_ptr: GuardedBufferPtr<B>) -> Self {
+
         Self {
             buf_ptr,
-            consumer_index,
+            consumer_counter: 0
         }
     }
 
     #[inline]
     pub fn next(&mut self) -> Option<ConsumerRef<B>> {
-        let (item_counter_ptr, recycle_to) = self.buf_ptr.get().consume_at(&mut self.consumer_index);
+
+        let item_counter_ptr = self.buf_ptr.get().consume_next(self.consumer_counter);
 
         if item_counter_ptr.is_null() {
             return None;
@@ -42,7 +44,6 @@ where
         Some(ConsumerRef {
             consumer: self,
             item_ptr: unsafe { NonNull::new_unchecked(item_counter_ptr.cast_mut()) },
-            recycle_to
         })
     }
 
@@ -51,24 +52,27 @@ where
     where
         F: FnOnce(&<B as RecyclerBuffer>::ItemType),
     {
-        let (item_counter_ptr, recycle_to) = self.buf_ptr.get().consume_at(&mut self.consumer_index);
+
+        let item_counter_ptr = self.buf_ptr.get().consume_next(self.consumer_counter);
 
         if item_counter_ptr.is_null() {
+            // println!("{:?}'s consumer is shutting down", std::thread::current().id());
             return false;
         }
+        self.consumer_counter += 1;
         let item_counter = unsafe { item_counter_ptr.as_ref().unwrap() };
         f(&item_counter.item);
 
-        let left = item_counter.decrement();
-        println!("consumed item at {recycle_to}, count left is {}", left - 1);
-        if left == 1 {
-            println!("attempting to reycle to {recycle_to}");
+
+        if item_counter.decrement() == 1 {
+            // println!("attempting to reycle to {recycle_to}");
             self.buf_ptr
             .get()
-            .recycle(recycle_to);
+            .recycle();
         }
         true
     }
+
 }
 
 pub struct ConsumerRef<'a, B>
@@ -78,7 +82,6 @@ where
 {
     consumer: &'a Consumer<B>,
     item_ptr: NotNullItem<<B as RecyclerBuffer>::ItemType>,
-    recycle_to: usize
 }
 
 impl<'a, B> Deref for ConsumerRef<'a, B>
@@ -103,7 +106,7 @@ where
         let mut ptr = self.item_ptr;
         if unsafe { ptr.as_mut().decrement() } == 1 {
             // we last
-            self.consumer.buf_ptr.get().recycle(self.recycle_to);
+            self.consumer.buf_ptr.get().recycle();
         }
     }
 }

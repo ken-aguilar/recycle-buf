@@ -2,36 +2,57 @@ use std::{
     ops::{Deref, DerefMut},
     ptr::NonNull,
     sync::{
-        atomic::{AtomicU32, Ordering, AtomicUsize},
+        atomic::{Ordering, AtomicUsize},
         Arc, Condvar, Mutex,
     },
     time::Duration,
 };
 
-
-use crate::{sync_cell::SyncUnsafeCell, consumer::Consumer};
+use crate::sync_cell::SyncUnsafeCell;
 
 pub type NotNullItem<T> = NonNull<ItemCounter<T>>;
-pub type ContainerType<T> = *const ItemCounter<T>;
+pub type ContainerTypePtr<T> = * const ItemCounter<T>;
+pub type ContainerType<T> = ItemCounter<T>;
 pub type GuardedBufferPtr<B> = Arc<SyncUnsafeCell<B>>;
 
 pub type DynamicBufferPtr<T> = GuardedBufferPtr<DynamicBuffer<T>>;
 pub type StaticBufferPtr<T, const N: usize> = GuardedBufferPtr<StaticBuffer<T, N>>;
 
-pub fn make_container<T>(item: T) -> ContainerType<T> {
+pub fn make_container_ptr<T>(item: T) -> ContainerTypePtr<T> {
     // move the item to the heap via box
     let boxed = ItemCounter {
         item,
-        ref_counter: AtomicU32::new(0),
+        ref_counter: AtomicUsize::new(0),
+        sequence: Mutex::new(None),
+        item_recycle: Condvar::new(),
+        item_ready: Condvar::new(),
+        shutdown: false
     }
     .into_box();
     // get a pointer from the heap
     Box::into_raw(boxed)
 }
 
+pub fn make_container<T>(item: T) -> ContainerType<T> {
+    // move the item to the heap via box
+    ItemCounter {
+        item,
+        ref_counter: AtomicUsize::new(0),
+        sequence: Mutex::new(None),
+        item_recycle: Condvar::new(),
+        item_ready: Condvar::new(),
+        shutdown: false
+    }
+}
+
+#[derive(Debug)]
 pub struct ItemCounter<T> {
     pub item: T,
-    ref_counter: AtomicU32,
+    ref_counter: AtomicUsize,
+    pub(crate) sequence: Mutex<Option<usize>>,
+    item_recycle: Condvar,
+    item_ready: Condvar,
+    shutdown: bool
 }
 
 unsafe impl<T> Send for ItemCounter<T> where T: Send {}
@@ -44,24 +65,68 @@ impl<T> ItemCounter<T> {
     }
 
     #[inline]
-    pub fn increment(&self) -> u32 {
+    pub fn increment(&self) -> usize {
         self.ref_counter.fetch_add(1, Ordering::Relaxed)
     }
 
     #[inline]
-    pub fn decrement(&self) -> u32 {
+    pub fn decrement(&self) -> usize {
         self.ref_counter.fetch_sub(1, Ordering::Relaxed)
     }
 
+    pub(crate) fn recycle(&mut self) {
+        let mut lock = self.sequence.lock().unwrap();
+        // assert!(self.ref_counter.load(Ordering::Relaxed) == 0);
+            // println!("@@@@{:?}, self id{:p}", *lock, self);
+        *lock = None;
+        self.item_recycle.notify_all();
+    } 
+
     #[inline]
-    pub(crate) fn is_free(&self) -> bool{
-        self.ref_counter.load(Ordering::Relaxed) == 0
+    pub(crate) fn wait_until_ready(&self, consumer_counter: usize) -> bool {
+
+        let _lock= self.item_ready.wait_while(self.sequence.lock().unwrap(), |seq| {
+            // print!("{:?}", self.sequence);
+            seq.is_none() || seq.is_some_and(|v| v < consumer_counter)
+        }).unwrap();
+
+        // assert!(lock.is_some_and(|v| v >= consumer_counter));
+        self.shutdown
     }
 
     #[inline]
-    pub(crate) fn is_in_use(&self) -> bool{
-        self.ref_counter.load(Ordering::Relaxed) > 0
+    pub(crate) fn process_when_free<F>(&mut self, prod_sequnce: usize, ref_count: usize, f: F) where F: FnOnce(&mut T)
+    {
+
+        let mut lock = self.item_recycle.wait_while(self.sequence.lock().unwrap(), |seq| {
+            seq.is_some()
+        }).unwrap();
+
+        // assert!(lock.is_none());
+
+        *lock = Some(prod_sequnce);
+        
+        self.ref_counter.store(ref_count, Ordering::Relaxed);
+        
+        f(&mut self.item);
+        // assert!(*lock == Some(prod_sequnce));
+        
+        self.item_ready.notify_all();
+
     }
+
+    pub(crate) fn mark_shutdown(&mut self, prod_sequnce: usize, ref_cnt: usize) {
+        let mut lock = self.item_recycle.wait_while(self.sequence.lock().unwrap(), |seq| {
+            seq.is_some()
+        }).unwrap();
+
+        self.ref_counter.store(ref_cnt, Ordering::Relaxed);
+        self.shutdown = true;
+        *lock = Some(prod_sequnce);
+        self.item_ready.notify_all();
+
+    }
+
 
 }
 
@@ -72,15 +137,15 @@ pub trait RecyclerBuffer {
 }
 
 pub trait StackBuffer: RecyclerBuffer {
-    fn get_one(&mut self) -> Option<ContainerType<Self::ItemType>>;
-    fn wait_for_one(&mut self) -> ContainerType<Self::ItemType>;
-    fn timed_wait_for_one(&mut self, wait_time: Duration) -> Option<ContainerType<Self::ItemType>>;
+    fn get_one(&mut self) -> Option<ContainerTypePtr<Self::ItemType>>;
+    fn wait_for_one(&mut self) -> ContainerTypePtr<Self::ItemType>;
+    fn timed_wait_for_one(&mut self, wait_time: Duration) -> Option<ContainerTypePtr<Self::ItemType>>;
     fn recycle(&mut self, item: NotNullItem<Self::ItemType>);
     fn available(&self) -> u32;
     fn empty(&self) -> bool;
 }
 
-pub(crate) trait ProducerConsumerBuffer: RecyclerBuffer {
+pub trait ProducerConsumerBuffer: RecyclerBuffer {
     const MAX: usize;
 
     //fn consume_at(&mut self, consumer_state: &mut ConsumerState) -> (ContainerType<Self::ItemType>, usize);
@@ -89,28 +154,30 @@ pub(crate) trait ProducerConsumerBuffer: RecyclerBuffer {
         F: FnOnce(&mut Self::ItemType);
     fn shutdown(&mut self);
     fn drop_consumer(&mut self);
-    fn recycle(&mut self);
-    fn add_consumer<B>(&mut self, consumer: &mut Consumer<B>)  where B: ProducerConsumerBuffer + Send, <B as RecyclerBuffer>::ItemType: Send + Sync;
-    fn consume_next(&self, consumer_counter: usize) -> ContainerType<Self::ItemType>;
+    fn add_consumer(&mut self);
+    fn consume_next(&mut self, consumer_counter: usize) -> Option<&mut ContainerType<Self::ItemType>>;
 
 }
 
 #[derive(Debug)]
 pub struct DynamicBuffer<T> {
-    data: Box<[ContainerType<T>]>,
+    data: Box<[ContainerTypePtr<T>]>,
     index: usize,
     pub mutex: Mutex<()>,
     pub recycled_event: Condvar,
+    pub readied: Condvar,
+
 }
 
 impl<T> DynamicBuffer<T> {
-    pub fn new(data: Box<[ContainerType<T>]>) -> Self {
+    pub fn new(data: Box<[ContainerTypePtr<T>]>) -> Self {
 
         Self {
             data,
             index: 0,
             mutex: Mutex::new(()),
             recycled_event: Condvar::new(),
+            readied: Condvar::new()
         }
     }
 }
@@ -141,7 +208,7 @@ impl<T> RecyclerBuffer for DynamicBuffer<T> {
 impl<T> StackBuffer for DynamicBuffer<T> {
     #[inline]
     /// takes an item from the internal buffer
-    fn wait_for_one(&mut self) -> ContainerType<T> {
+    fn wait_for_one(&mut self) -> ContainerTypePtr<T> {
         // while empty wait until one is available
         let _lock = self
             .recycled_event
@@ -164,7 +231,7 @@ impl<T> StackBuffer for DynamicBuffer<T> {
         self.index == self.data.len()
     }
 
-    fn timed_wait_for_one(&mut self, wait_time: Duration) -> Option<ContainerType<Self::ItemType>> {
+    fn timed_wait_for_one(&mut self, wait_time: Duration) -> Option<ContainerTypePtr<Self::ItemType>> {
         // loop until one is available
         if let Ok((mut _lock, timeout)) =
             self.recycled_event
@@ -181,7 +248,7 @@ impl<T> StackBuffer for DynamicBuffer<T> {
         None
     }
 
-    fn get_one(&mut self) -> Option<ContainerType<Self::ItemType>> {
+    fn get_one(&mut self) -> Option<ContainerTypePtr<Self::ItemType>> {
         let _lock = self.mutex.lock().unwrap();
         if self.empty() {
             // empty
@@ -214,9 +281,9 @@ where
     data: [ContainerType<T>; SIZE],
 //    buffer_state: BufferState,
     consumer_count: u32,
-    mutex: Mutex<()>,
-    recycled_event: Condvar,
-    item_produced_event: Condvar,
+    // mutex: Mutex<()>,
+    // recycled_event: Condvar,
+    // item_produced_event: Condvar,
     pub(crate) producer_counter: usize,
 }
 
@@ -227,37 +294,16 @@ where
     T: Send + Sync,
 {
     pub fn new(data: [ContainerType<T>; SIZE]) -> Self {
-        unsafe {
-            for item in data {
-                item.cast_mut().as_mut().unwrap().ref_counter.store(0, Ordering::Relaxed);
-            }
+        for item in &data {
+            item.ref_counter.store(0, Ordering::Relaxed);
         }
         Self {
             data,
             consumer_count: 0,
-            mutex: Mutex::new(()),
-            recycled_event: Condvar::new(),
-            item_produced_event: Condvar::new(),
             producer_counter: 0
         }
     }
 
-}
-
-impl<T, const SIZE: usize> Drop for StaticBuffer<T, SIZE>
-where
-    T: Send + Sync,
-{
-    fn drop(&mut self) {
-        // we have to manually drop each item in the buffer
-        self.data
-            .iter()
-            .for_each(|ptr: &*const ItemCounter<T>| unsafe {
-                if !ptr.is_null() {
-                    drop(Box::from_raw(ptr.cast_mut()));
-                }
-            })
-    }
 }
 
 impl<T, const SIZE: usize> RecyclerBuffer for StaticBuffer<T, SIZE>
@@ -265,16 +311,6 @@ where
     T: Send + Sync,
 {
     type ItemType = T;
-
-    // #[inline]
-    // fn available(&self) -> u32 {
-    //     self.buffer_state.available()
-    // }
-
-    // #[inline]
-    // fn empty(&self) -> bool {
-    //     self.buffer_state.is_empty()
-    // }
 
     #[inline]
     fn capacity(&self) -> u32 {
@@ -290,73 +326,40 @@ where
 
     const MAX: usize = SIZE;
 
-    #[inline]
-    fn recycle(&mut self) {
 
-        //println!("recycling {index_to_recyle}");
-
-        self.recycled_event.notify_one();
-    }
 
     #[inline]
     fn broadcast<F>(&mut self, f: F)
     where
         F: FnOnce(&mut Self::ItemType),
     {
-
-
-        let index = self.producer_counter % self.capacity() as usize;
         
-        let next_item = unsafe {self.data[index].cast_mut().as_mut().unwrap()};
+        let next_item = &mut self.data[self.producer_counter % self.capacity() as usize];
         
-        let _lock = if next_item.is_in_use() {
-            //println!("Producer counter {}: waiting for {index}", self.producer_counter);
-            // our next item is still in use, wait for a recycle event and check again
-            // while empty wait until one is available
-            self
-            .recycled_event
-            .wait_while(self.mutex.lock().unwrap(), |_b| next_item.is_in_use()).unwrap()
-        } else {
-            self.mutex.lock().unwrap()
-        };
-    
-        let ref_count = self.consumer_count;
-
-        //println!("Producer counter {}: Writing to item at {index}, ref count {ref_count}", self.producer_counter);
-        next_item
-            .ref_counter
-            .store(ref_count, Ordering::Relaxed);
-
-        f(&mut next_item.item);
+        next_item.process_when_free(self.producer_counter, self.consumer_count as usize, f);
 
         // assert!(next_item.ref_counter.load(Ordering::Relaxed) == ref_count);
         self.producer_counter += 1;
- 
-        self.item_produced_event.notify_all();
+
     }
 
     #[inline]
-    fn add_consumer<B>(&mut self, consumer: &mut Consumer<B>) where B: ProducerConsumerBuffer + Send, <B as RecyclerBuffer>::ItemType: Send + Sync {
-        let _lock = self.mutex.lock().unwrap();
-
+    fn add_consumer(&mut self) {
         self.consumer_count += 1;
-//        consumer.get_state().join(&self.buffer_state);
 
     }
 
     #[inline]
-    fn consume_next(&self, consumer_counter: usize) -> ContainerType<Self::ItemType> {
-        //let mut lock = self.mutex.lock().unwrap();
+    fn consume_next(&mut self, consumer_counter: usize) -> Option<&mut ContainerType<Self::ItemType>> {
 
-        if self.producer_counter <= consumer_counter {
-            // wait until next produce event
-            let _lock = self.item_produced_event.wait_while(self.mutex.lock().unwrap(), |_b| {
-                self.producer_counter <= consumer_counter
-            }).unwrap();
+        let item = &mut self.data[ consumer_counter % self.capacity() as usize];
+
+        if item.wait_until_ready(consumer_counter) {
+            // println!("quitting this consumer");
+            None
+        } else {
+            Some(item)
         }
-
-        let index = consumer_counter % self.capacity() as usize;
-        self.data[index]
     }
 
     #[inline]
@@ -364,34 +367,18 @@ where
 
         let index = self.producer_counter % self.capacity() as usize;
         
-        let next_item = unsafe {self.data[index].cast_mut().as_mut().unwrap()};
+        let next_item = &mut self.data[index];
         
-        if !next_item.is_free() {
-            // our next item is still in use, wait for a recycle event and check again
-            // while empty wait until one is available
-            let _lock = self
-            .recycled_event
-            .wait_while(self.mutex.lock().unwrap(), |_b| next_item.is_free())
-            .unwrap();
-        }
-
-        let raw_ptr = next_item as *mut ItemCounter<T>;
-
-        unsafe {    
-            // since we are going to override the item in the data array with null
-            // we will need to drop it, otherwise the pointer will be lost
-            drop(Box::from_raw(raw_ptr));
-        }
-        self.data[index] = <Self as RecyclerBuffer>::NULL_ITEM;
+        next_item.mark_shutdown(self.producer_counter, self.consumer_count as usize);
 
         self.producer_counter += 1;
         
-        self.item_produced_event.notify_all();
+        //self.item_produced_event.notify_all();
     }
 
     #[inline]
     fn drop_consumer(&mut self) {
-        let _lock = self.mutex.lock().unwrap();
+        // let _lock = self.mutex.lock().unwrap();
         self.consumer_count -= 1;
     }
 
@@ -527,7 +514,7 @@ where
     fn clone(&self) -> Self {
         let old_rc = unsafe { self.item_ptr.as_ref().increment() };
 
-        if old_rc >= isize::MAX as u32 {
+        if old_rc >= usize::MAX {
             std::process::abort();
         }
 

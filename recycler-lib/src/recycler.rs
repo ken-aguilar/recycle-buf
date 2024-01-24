@@ -2,7 +2,7 @@ use std::{ptr::NonNull, time::Duration};
 
 use crate::{
     buffer::{
-        make_container, ContainerType, DynamicBuffer, DynamicBufferPtr, GuardedBufferPtr,
+        make_container_ptr, ContainerTypePtr, DynamicBuffer, DynamicBufferPtr, GuardedBufferPtr,
         NotNullItem, ProducerConsumerBuffer, RecycleRef, RecyclerBuffer, SharedRecycleRef,
         StackBuffer,
     },
@@ -108,15 +108,12 @@ where
     }
 
     pub fn create_consumer(&mut self) -> Consumer<B> {
-        let mut new_consumer = Consumer::new(
+        self.inner.get().add_consumer();
+
+        Consumer::new(
             self.inner.clone(),
-        );
-        self.inner.get().add_consumer(&mut new_consumer);
-
-        new_consumer
-
+        )
     }
-
 
     pub fn shutdown(&self) {
         self.inner.get().shutdown();
@@ -129,7 +126,7 @@ pub struct RecyclerBuilder<T>
 where
     T: Send,
 {
-    contents: Vec<ContainerType<T>>,
+    contents: Vec<ContainerTypePtr<T>>,
 }
 
 impl<T> RecyclerBuilder<T>
@@ -142,7 +139,7 @@ where
 
     /// moves a pre-constructed instance of T and makes it available in the recycler buffer when created
     pub fn push(mut self, item: T) -> Self {
-        self.contents.push(make_container(item));
+        self.contents.push(make_container_ptr(item));
         Self {
             contents: self.contents,
         }
@@ -153,7 +150,7 @@ where
         I: IntoIterator<Item = T>,
     {
         self.contents
-            .extend(items.into_iter().map(|item| make_container(item)));
+            .extend(items.into_iter().map(|item| make_container_ptr(item)));
         Self {
             contents: self.contents,
         }

@@ -1,8 +1,8 @@
 use std::{ops::Deref, ptr::NonNull};
 
-use crate::{buffer::{GuardedBufferPtr, NotNullItem, ProducerConsumerBuffer, RecyclerBuffer}, ordering::ConsumerState};
+use crate::buffer::{GuardedBufferPtr, NotNullItem, ProducerConsumerBuffer, RecyclerBuffer, ContainerType};
 
-pub(crate) struct Consumer<B>
+pub struct Consumer<B>
 where
     B: ProducerConsumerBuffer + Send,
     <B as RecyclerBuffer>::ItemType: Send + Sync,
@@ -35,15 +35,20 @@ where
     #[inline]
     pub fn next(&mut self) -> Option<ConsumerRef<B>> {
 
-        let item_counter_ptr = self.buf_ptr.get().consume_next(self.consumer_counter);
-
-        if item_counter_ptr.is_null() {
+        let Some(item_counter_ptr) = self.buf_ptr.get().consume_next(self.consumer_counter) else {
             return None;
+        };
+
+        self.consumer_counter += 1;
+                
+        if item_counter_ptr.decrement() == 1 {
+            // println!("attempting to reycle seq {:?}", item_counter.sequence);
+            item_counter_ptr.recycle();
         }
 
         Some(ConsumerRef {
             consumer: self,
-            item_ptr: unsafe { NonNull::new_unchecked(item_counter_ptr.cast_mut()) },
+            item_ptr: unsafe { NonNull::new_unchecked(item_counter_ptr as *mut ContainerType<<B as RecyclerBuffer>::ItemType>) },
         })
     }
 
@@ -53,22 +58,21 @@ where
         F: FnOnce(&<B as RecyclerBuffer>::ItemType),
     {
 
-        let item_counter_ptr = self.buf_ptr.get().consume_next(self.consumer_counter);
+        let buf_ptr = self.buf_ptr.get();
 
-        if item_counter_ptr.is_null() {
-            // println!("{:?}'s consumer is shutting down", std::thread::current().id());
+        let Some(item_counter) = buf_ptr.consume_next(self.consumer_counter) else {
             return false;
-        }
-        self.consumer_counter += 1;
-        let item_counter = unsafe { item_counter_ptr.as_ref().unwrap() };
-        f(&item_counter.item);
+        };
 
+        self.consumer_counter += 1;
+
+        f(&item_counter.item);
+                
+        // println!("{:?} consuming {}, rf cnt {}", std::thread::current().id(), self.consumer_counter, left);
 
         if item_counter.decrement() == 1 {
-            // println!("attempting to reycle to {recycle_to}");
-            self.buf_ptr
-            .get()
-            .recycle();
+            // println!("attempting to reycle seq {:?}", item_counter.sequence);
+            item_counter.recycle();
         }
         true
     }
@@ -104,9 +108,12 @@ where
 {
     fn drop(&mut self) {
         let mut ptr = self.item_ptr;
-        if unsafe { ptr.as_mut().decrement() } == 1 {
-            // we last
-            self.consumer.buf_ptr.get().recycle();
+        unsafe {
+            if  ptr.as_mut().decrement() == 1 {
+                // we last
+                self.item_ptr.as_mut().recycle();
+            }
+
         }
     }
 }

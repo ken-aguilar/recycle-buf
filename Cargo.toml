@@ -1,19 +1,6 @@
-[package]
-name = "recycle_buf"
-version = "0.1.4"
-authors = ["Ken Aguilar <ken.aguilar@gmail.com>"]
-license = "MIT"
-homepage = "https://github.com/ken-aguilar/recycle-buf"
-description = "A memory recycling system"
-edition = "2021"
+[workspace]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-
-[dev-dependencies]
-tokio = { version = "1", features = ["full"] }
-futures = "0"
-crossbeam = "0"
-
-[dependencies]
-bit-set = "0.5.3"
+members = [
+    "recycler-lib",
+    "tester",
+]

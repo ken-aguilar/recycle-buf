@@ -34,8 +34,6 @@ where
     pub fn capacity(&self) -> usize {
         self.inner.get().capacity() as usize
     }
-
-
 }
 
 // recycler capabilities for when the underlying buffer implements StackBuffer
@@ -104,15 +102,13 @@ where
         <B as RecyclerBuffer>::ItemType: Send + Sync,
         F: FnOnce(&mut <B as RecyclerBuffer>::ItemType),
     {
-        self.inner.get().broadcast(f);
+        self.inner.get().produce_item(f);
     }
 
     pub fn create_consumer(&mut self) -> Consumer<B> {
         self.inner.get().add_consumer();
 
-        Consumer::new(
-            self.inner.clone(),
-        )
+        Consumer::new(self.inner.clone())
     }
 
     pub fn shutdown(&self) {

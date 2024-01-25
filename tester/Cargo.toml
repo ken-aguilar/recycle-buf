@@ -5,12 +5,12 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-#[profile.release]
-#lto = "fat"
-#panic = "abort"
+[profile.release]
+lto = "fat"
+panic = "abort"
 
-#[build]
-#rustflags = ["-C", "target-cpu=native"]
+[build]
+rustflags = ["-C", "target-cpu=native"]
 
 [dependencies]
 recycle_buf = { path = "../recycler-lib" }

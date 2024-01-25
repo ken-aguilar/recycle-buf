@@ -7,7 +7,6 @@ pub mod consumer;
 pub mod recycler;
 pub mod sync_cell;
 
-
 #[cfg(test)]
 mod tests {
 
@@ -15,10 +14,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::buffer::SharedRecycleRef;
-    use crate::{
-        buffer::DynamicBuffer,
-        recycler::RecyclerBuilder,
-    };
+    use crate::{buffer::DynamicBuffer, recycler::RecyclerBuilder};
 
     #[test]
     fn single_threaded() {
@@ -130,22 +126,16 @@ mod tests {
 
         const CAPACITY: usize = 7;
 
-        let mut recycler = RecyclerBuilder::<TestItem>::new().generate(7, |i|{
-            TestItem {
+        let mut recycler = RecyclerBuilder::<TestItem>::new()
+            .generate(7, |_i| TestItem {
                 name: "Item".to_string(),
                 count: 0,
-                sent: 0
-            }
-        }).build();
-
-        // let mut recycler = RecyclerBuilder::<Item>::new()
-        // .generate(CAPACITY, |_i| Item {name: "Item".into(), count: 0})
-        // .build();
+            })
+            .build();
 
         assert!(recycler.capacity() == CAPACITY);
 
         let item = recycler.take().unwrap();
-
 
         assert!(item.name == "Item");
         assert!(item.count == 0);
@@ -234,80 +224,10 @@ mod tests {
         println!("test completed in {:.2}s", elapse.as_secs_f32());
     }
 
-    //#[ignore = "reason"]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn multi_threaded_strings_tokio_no_rec() {
-        use std::time::Instant;
-        use tokio::sync::broadcast::channel;
-
-        const CAPACITY: usize = 32;
-
-
-        let (tx, rx) = channel::<TestItem>(CAPACITY);
-
-        let mut handles = vec![];
-
-        let thread_count = 7;
-        let barrier = Arc::new(tokio::sync::Barrier::new(thread_count+1));
-        for id in 0..thread_count {
-            let bar = barrier.clone();
-
-            let mut thread_recv = tx.subscribe();
-            handles.push(tokio::task::spawn(async move {
-                bar.wait().await;
-                let mut count = 0usize;
-                let my_name = id.to_string();
-                
-                while let Ok(item) = thread_recv.recv().await {
-                    if item.name == my_name {
-                        count += item.count;
-                    }
-                }
-                
-                (id, count)
-            }));
-        }
-        // this rx is never used but will keep any items sent on the channel from being dropped so we need to drop it
-        drop(rx);
-
-        let mut total_count_sent = vec![0usize; thread_count];
-
-        let iterations = 100;
-
-        let start = Instant::now();
-        barrier.wait().await;
-        for round in 1..iterations {
-            let id = round % thread_count;
-            tx.send(TestItem {
-                name: id.to_string(),
-                count: round as usize,
-                sent: 0
-            }).unwrap();         
-            tokio::time::sleep(Duration::from_micros(500)).await;
-            total_count_sent[id] += round as usize;
-        }
-
-        // should cause threads leave their loop when the tx end is dropped
-        drop(tx);
-
-        let results = futures::future::try_join_all(handles).await;
-        let elapse = start.elapsed();
-
-        assert!(results.is_ok());
-
-        for result in results.ok().unwrap() {
-            //println!("thread {} returning {}", result.0, result.1);
-            assert!(result.1 == total_count_sent[result.0]);
-        }
-
-        println!("test completed in {:.2}s", elapse.as_secs_f32());
-    }
-
     #[derive(Debug, Clone)]
     struct TestItem {
         name: String,
         count: usize,
-        sent: usize
     }
 
     #[test]

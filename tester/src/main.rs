@@ -1,17 +1,21 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use recycle_buf::{recycler::{Recycler, RecyclerBuilder}, buffer::{StaticBuffer, make_container_ptr, StaticBufferPtr, SharedRecycleRef, DynamicBuffer, make_container}, sync_cell::SyncUnsafeCell};
+use recycle_buf::{
+    buffer::{make_container, DynamicBuffer, SharedRecycleRef, StaticBuffer, StaticBufferPtr},
+    recycler::{Recycler, RecyclerBuilder},
+    sync_cell::SyncUnsafeCell,
+};
 
+const CAPACITY: usize = 32;
+const ITERATIONS: usize = 200_000;
 
-
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TestItem {
     name: String,
     count: usize,
-    sent: usize
+    sent: usize,
 }
-fn setup() -> Recycler::<StaticBuffer<TestItem, 32>>{
+fn setup() -> Recycler<StaticBuffer<TestItem, 32>> {
     const CAPACITY: usize = 32;
 
     let fr = StaticBuffer::<TestItem, CAPACITY>::new([
@@ -19,115 +23,6 @@ fn setup() -> Recycler::<StaticBuffer<TestItem, 32>>{
             name: "Item".to_string(),
             count: 0,
             sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
         }),
         make_container(TestItem {
             name: "Item".to_string(),
@@ -138,95 +33,168 @@ fn setup() -> Recycler::<StaticBuffer<TestItem, 32>>{
             name: "Item".to_string(),
             count: 0,
             sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
-        }),
-        make_container(TestItem {
-            name: "Item".to_string(),
-            count: 0,
-            sent: 0,
-
         }),
         make_container(TestItem {
             name: "Item".to_string(),
             count: 0,
             sent: 0,
         }),
-
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
+        make_container(TestItem {
+            name: "Item".to_string(),
+            count: 0,
+            sent: 0,
+        }),
     ]);
-    
-    Recycler::<StaticBuffer<TestItem, CAPACITY>>::new(StaticBufferPtr::new(
-        SyncUnsafeCell::new(fr),
-    ))
-    
+
+    Recycler::<StaticBuffer<TestItem, CAPACITY>>::new(StaticBufferPtr::new(SyncUnsafeCell::new(fr)))
 }
 
 async fn multi_threaded_strings_tokio() {
     use std::time::Instant;
     use tokio::sync::broadcast::channel;
 
-    const CAPACITY: usize = 32;
-
-    let mut recycler = RecyclerBuilder::<TestItem>::new().generate(32, |i|{
-        TestItem {
+    let mut recycler = RecyclerBuilder::<TestItem>::new()
+        .generate(32, |_i| TestItem {
             name: "Item".to_string(),
             count: 0,
-            sent: 0
-        }
-    }).build();
+            sent: 0,
+        })
+        .build();
     assert!(recycler.capacity() == CAPACITY);
 
     let item = recycler.take().unwrap();
@@ -293,22 +261,20 @@ async fn multi_threaded_strings_tokio() {
         assert!(result.1 == total_count_sent[result.0]);
     }
 
-    println!("test completed in {:.2}s", elapse.as_secs_f32());
+    println!("test completed in {:.3}s", elapse.as_secs_f32());
 }
 
 fn multi_threaded_strings_custom() {
     use std::time::Instant;
 
-    const CAPACITY: usize = 32;
-
-    let mut recycler= setup();
+    let mut recycler = setup();
 
     assert!(recycler.capacity() == CAPACITY);
 
     let mut handles = vec![];
 
     let thread_count = 7;
-    let barrier = Arc::new(std::sync::Barrier::new(thread_count+1));
+    let barrier = Arc::new(std::sync::Barrier::new(thread_count + 1));
 
     for id in 0..thread_count {
         let mut consumer = recycler.create_consumer();
@@ -317,9 +283,9 @@ fn multi_threaded_strings_custom() {
             let mut count = 0usize;
             let my_name = id.to_string();
             let mut total_events = 0;
-          b.wait();
+            b.wait();
             loop {
-                if !consumer.next_fn(|item| {
+                if !consumer.next_item_fn(|item| {
                     total_events += 1;
                     if item.name == my_name {
                         // if item.count != total_events {
@@ -339,14 +305,12 @@ fn multi_threaded_strings_custom() {
         }));
     }
 
-barrier.wait();
+    barrier.wait();
 
     let mut total_count_sent = vec![0usize; thread_count];
 
-    let iterations = 200_000;
-
     let start = Instant::now();
-    for round in 1..iterations {
+    for round in 1..ITERATIONS {
         recycler.wait_and_broadcast(|v| {
             let id = round % thread_count;
             v.name = id.to_string();
@@ -363,18 +327,21 @@ barrier.wait();
     }
     let elapse = start.elapsed();
 
-    println!("test producer consumer completed in {:.2}s", elapse.as_secs_f32());
+    println!(
+        "test producer consumer completed in {:.3}s",
+        elapse.as_secs_f32()
+    );
     println!("Waiting for threads");
     for result in results.into_iter() {
         match result {
             Ok((id, value, total_events)) => {
                 let expected = total_count_sent[id];
-            //    println!("thread {} expecting {}, got {} and had {} total_events", id, expected, value, total_events);
+                //    println!("thread {} expecting {}, got {} and had {} total_events", id, expected, value, total_events);
                 assert!(
                     value == expected,
                     "thread {id}, expected {expected} but got {value}"
                 );
-                assert!(total_events == (iterations - 1));
+                assert!(total_events == (ITERATIONS - 1));
             }
             Err(e) => {
                 eprintln!("Error: {e:?}");
@@ -383,12 +350,82 @@ barrier.wait();
     }
 }
 
+async fn multi_threaded_strings_tokio_no_rec() {
+    use std::time::Instant;
+    use tokio::sync::broadcast::channel;
+
+    let (tx, rx) = channel::<TestItem>(CAPACITY * 10);
+
+    let mut handles = vec![];
+
+    let thread_count = 7;
+    let barrier = Arc::new(tokio::sync::Barrier::new(thread_count + 1));
+    for id in 0..thread_count {
+        let bar = barrier.clone();
+
+        let mut thread_recv = tx.subscribe();
+        handles.push(tokio::task::spawn(async move {
+            bar.wait().await;
+            let mut count = 0usize;
+            let my_name = id.to_string();
+
+            while let Ok(item) = thread_recv.recv().await {
+                if item.name == my_name {
+                    count += item.count;
+                }
+            }
+
+            (id, count)
+        }));
+    }
+    // this rx is never used but will keep any items sent on the channel from being dropped so we need to drop it
+    drop(rx);
+
+    let mut total_count_sent = vec![0usize; thread_count];
+
+    let start = Instant::now();
+    barrier.wait().await;
+    for round in 1..ITERATIONS {
+        let id = round % thread_count;
+        tx.send(TestItem {
+            name: id.to_string(),
+            count: round as usize,
+            sent: 0,
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_micros(1)).await;
+        total_count_sent[id] += round as usize;
+    }
+
+    // should cause threads leave their loop when the tx end is dropped
+    drop(tx);
+
+    let results = futures::future::try_join_all(handles).await;
+    let elapse = start.elapsed();
+
+    assert!(results.is_ok());
+
+    for result in results.ok().unwrap() {
+        //println!("thread {} returning {}", result.0, result.1);
+        assert!(result.1 == total_count_sent[result.0]);
+    }
+
+    println!("test completed in {:.2}s", elapse.as_secs_f32());
+}
+
 fn main() {
-    println!("Num threads {}", std::thread::available_parallelism().expect("failed to get threads"));
+    println!(
+        "Num threads {}",
+        std::thread::available_parallelism().expect("failed to get threads")
+    );
     multi_threaded_strings_custom();
 
-    let rt = tokio::runtime::Builder::new_multi_thread().build().expect("could npt build rt");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_time()
+        .build()
+        .expect("could npt build rt");
 
-    rt.block_on(multi_threaded_strings_tokio())
+    rt.block_on(multi_threaded_strings_tokio());
 
+    rt.block_on(multi_threaded_strings_tokio_no_rec())
 }

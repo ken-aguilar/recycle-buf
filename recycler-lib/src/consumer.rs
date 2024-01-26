@@ -28,7 +28,7 @@ where
     pub fn new(buf_ptr: GuardedBufferPtr<B>) -> Self {
         Self {
             buf_ptr,
-            consumer_counter: 0,
+            consumer_counter: 1,
         }
     }
 

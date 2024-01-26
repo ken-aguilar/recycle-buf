@@ -23,10 +23,13 @@ pub fn make_container_ptr<T>(item: T) -> ContainerTypePtr<T> {
     let boxed = ItemCounter {
         item,
         ref_counter: AtomicUsize::new(0),
-        sequence: Mutex::new(None),
+        state: Mutex::new(ItemState{
+            free: true,
+            sequence: 0,
+            terminator: false
+        }),
         item_recycle: Condvar::new(),
         item_ready: Condvar::new(),
-        shutdown: false,
     }
     .into_box();
     // get a pointer from the heap
@@ -38,21 +41,44 @@ pub fn make_container<T>(item: T) -> ContainerType<T> {
     ItemCounter {
         item,
         ref_counter: AtomicUsize::new(0),
-        sequence: Mutex::new(None),
+        state: Mutex::new(ItemState{
+            free: true,
+            sequence: 0,
+            terminator: false
+        }),
         item_recycle: Condvar::new(),
         item_ready: Condvar::new(),
-        shutdown: false,
     }
 }
 
 #[derive(Debug)]
+struct ItemState {
+    sequence: usize,
+    free: bool,
+    terminator: bool
+}
+
+impl ItemState {
+
+    #[inline]
+    fn publish(&mut self, sequence: usize) {
+        self.free = false;
+        self.sequence = sequence;
+    }
+
+    fn set_termination_sequnece(&mut self, sequence: usize) {
+        self.free = false;
+        self.sequence = sequence;
+        self.terminator = true;
+    }
+}
+#[derive(Debug)]
 pub struct ItemCounter<T> {
     pub item: T,
     ref_counter: AtomicUsize,
-    pub(crate) sequence: Mutex<Option<usize>>,
+    state: Mutex<ItemState>,
     item_recycle: Condvar,
     item_ready: Condvar,
-    shutdown: bool,
 }
 
 unsafe impl<T> Send for ItemCounter<T> where T: Send {}
@@ -76,32 +102,32 @@ impl<T> ItemCounter<T> {
 
     #[inline]
     pub(crate) fn recycle(&mut self) {
-        *self.sequence.lock().unwrap() = None;
+        self.state.lock().unwrap().free = true;
         self.item_recycle.notify_all();
     }
 
     #[inline]
     pub(crate) fn wait_until_ready(&self, consumer_counter: usize) -> bool {
-        let _lock = self
+        let state_lock = self
             .item_ready
-            .wait_while(self.sequence.lock().unwrap(), |seq| {
-                seq.is_none() || seq.is_some_and(|v| v < consumer_counter)
+            .wait_while(self.state.lock().unwrap(), |s| {
+                s.sequence < consumer_counter
             })
             .unwrap();
 
-        self.shutdown
+        state_lock.terminator
     }
 
     #[inline]
     pub(crate) fn wait_until_free(&mut self, prod_sequnce: usize, ref_count: usize) {
-        let mut lock = self
+        let mut state_lock = self
             .item_recycle
-            .wait_while(self.sequence.lock().unwrap(), |seq| seq.is_some())
+            .wait_while(self.state.lock().unwrap(), |s| !s.free)
             .unwrap();
 
-        *lock = Some(prod_sequnce);
+        state_lock.publish(prod_sequnce);
         self.ref_counter.store(ref_count, Ordering::Relaxed);
-        drop(lock);
+        drop(state_lock);
     }
 
     #[inline]
@@ -109,30 +135,29 @@ impl<T> ItemCounter<T> {
     where
         F: FnOnce(&mut T),
     {
-        let mut lock = self
+        let mut state_lock = self
             .item_recycle
-            .wait_while(self.sequence.lock().unwrap(), |seq| seq.is_some())
+            .wait_while(self.state.lock().unwrap(), |s| !s.free)
             .unwrap();
 
         // assert!(*lock == Some(prod_sequnce));
         self.ref_counter.store(ref_count, Ordering::Relaxed);
         f(&mut self.item);
-        *lock = Some(prod_sequnce);
-        drop(lock);
+        state_lock.publish(prod_sequnce);
+        drop(state_lock);
         
         self.item_ready.notify_all();
     }
 
     pub(crate) fn mark_shutdown(&mut self, prod_sequnce: usize, ref_cnt: usize) {
-        let mut lock = self
+        let mut state_lock = self
             .item_recycle
-            .wait_while(self.sequence.lock().unwrap(), |seq| seq.is_some())
+            .wait_while(self.state.lock().unwrap(), |s| !s.free)
             .unwrap();
-        self.shutdown = true;
-        *lock = Some(prod_sequnce);
-        drop(lock);
-
+        state_lock.set_termination_sequnece(prod_sequnce);
         self.ref_counter.store(ref_cnt, Ordering::Relaxed);
+        drop(state_lock);
+
         self.item_ready.notify_all();
     }
 }
@@ -316,8 +341,8 @@ where
 
     #[inline]
     fn producer_next_item(&mut self) ->(&mut ContainerType<T>, usize, u32) { 
-        let current_producer_counter = self.producer_counter;
         self.producer_counter += 1;
+        let current_producer_counter = self.producer_counter;
         (&mut self.data[current_producer_counter % self.capacity()], current_producer_counter, self.consumer_count)
     }
 }

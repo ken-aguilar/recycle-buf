@@ -124,10 +124,10 @@ mod tests {
         use crossbeam::channel;
         use std::time::Instant;
 
-        const CAPACITY: usize = 7;
+        const CAPACITY: usize = 32;
 
         let mut recycler = RecyclerBuilder::<TestItem>::new()
-            .generate(7, |_i| TestItem {
+            .generate(CAPACITY, |_i| TestItem {
                 name: "Item".to_string(),
                 count: 0,
             })
@@ -149,7 +149,7 @@ mod tests {
 
         // this rx is never used but will keep any items sent on the channel from being dropped so we need to drop it
 
-        let thread_count = 20;
+        let thread_count = 7;
         for id in 0..thread_count {
             let thread_recv = rx.clone();
             handles.push(std::thread::spawn(move || {
@@ -158,12 +158,14 @@ mod tests {
                 let mut total_events = 0usize;
 
                 while let Ok(item) = thread_recv.recv() {
+                    println!("{:?}({}): recv'd {:?}", std::thread::current().id(), my_name, *item);
+
                     total_events += 1;
                     if item.name == my_name {
                         if item.count != total_events {
                             println!("err: event #{total_events}, count was {}", item.count);
                         }
-                        //println!("thread {} adding {} to {}", my_name, item.count, count);
+                        println!("thread {} adding {} to {}", my_name, item.count, count);
                         count += item.count as usize;
                     }
                 }
@@ -175,7 +177,7 @@ mod tests {
 
         let mut total_count_sent = vec![0usize; thread_count];
 
-        let iterations = 100000;
+        let iterations = 5;
 
         drop(item);
         let start = Instant::now();

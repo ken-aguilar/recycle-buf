@@ -1,14 +1,11 @@
 use std::{
-    ops::{Deref, DerefMut},
-    ptr::NonNull,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
+    marker::PhantomData, ops::{Deref, DerefMut}, ptr::NonNull, sync::{
         Arc, Condvar, Mutex,
-    },
-    time::Duration,
+    }, time::Duration
 };
 
 use crate::sync_cell::SyncUnsafeCell;
+use crossbeam_utils::CachePadded;
 
 pub type NotNullItem<T> = NonNull<ItemCounter<T>>;
 pub type ContainerTypePtr<T> = *const ItemCounter<T>;
@@ -16,94 +13,83 @@ pub type ContainerType<T> = ItemCounter<T>;
 pub type GuardedBufferPtr<B> = Arc<SyncUnsafeCell<B>>;
 
 pub type DynamicBufferPtr<T> = GuardedBufferPtr<DynamicBuffer<T>>;
-pub type StaticBufferPtr<T, const N: usize> = GuardedBufferPtr<StaticBuffer<T, N>>;
+pub type StaticBufferPtr<T, C> = GuardedBufferPtr<SequenceBuffer<T, C>>;
 
 pub fn make_container_ptr<T>(item: T) -> ContainerTypePtr<T> {
     // move the item to the heap via box
-    let boxed = ItemCounter {
-        item,
-        ref_counter: AtomicUsize::new(0),
-        state: Mutex::new(ItemState{
-            free: true,
-            sequence: 0,
-            terminator: false
-        }),
-        item_recycle: Condvar::new(),
-        item_ready: Condvar::new(),
-    }
+    let boxed = ItemCounter::new(item)
     .into_box();
     // get a pointer from the heap
     Box::into_raw(boxed)
 }
 
-pub fn make_container<T>(item: T) -> ContainerType<T> {
-    // move the item to the heap via box
-    ItemCounter {
-        item,
-        ref_counter: AtomicUsize::new(0),
-        state: Mutex::new(ItemState{
-            free: true,
-            sequence: 0,
-            terminator: false
-        }),
-        item_recycle: Condvar::new(),
-        item_ready: Condvar::new(),
-    }
-}
-
 #[derive(Debug)]
 struct ItemState {
-    sequence: usize,
-    free: bool,
-    terminator: bool
+    sequence: CachePadded<usize>,
+    ref_counter: CachePadded<usize>,
 }
 
 impl ItemState {
 
     #[inline]
     fn publish(&mut self, sequence: usize) {
-        self.free = false;
-        self.sequence = sequence;
+        *self.sequence = sequence;
     }
 
-    fn set_termination_sequnece(&mut self, sequence: usize) {
-        self.free = false;
-        self.sequence = sequence;
-        self.terminator = true;
+    fn set_termination_sequnece(&mut self) {
+        *self.sequence = usize::MAX;
     }
 }
 #[derive(Debug)]
 pub struct ItemCounter<T> {
     pub item: T,
-    ref_counter: AtomicUsize,
     state: Mutex<ItemState>,
     item_recycle: Condvar,
     item_ready: Condvar,
 }
 
-unsafe impl<T> Send for ItemCounter<T> where T: Send {}
 unsafe impl<T> Sync for ItemCounter<T> where T: Sync {}
 
 impl<T> ItemCounter<T> {
+
+    pub fn new(item: T) -> Self {
+        Self {
+            item,
+            state: Mutex::new(ItemState{
+                sequence: CachePadded::new(0),
+                ref_counter: CachePadded::new(0)
+            }),
+            item_recycle: Condvar::new(),
+            item_ready: Condvar::new(),
+        }
+    }
+
     #[inline]
     fn into_box(self) -> Box<Self> {
         Box::new(self)
     }
 
     #[inline]
-    pub fn increment(&self) -> usize {
-        self.ref_counter.fetch_add(1, Ordering::Relaxed)
+    pub fn increment_ref_count(&self)  {
+        let mut lock = self.state.lock().unwrap();
+        
+        *lock.ref_counter += 1;
     }
 
     #[inline]
-    pub fn decrement(&self) -> usize {
-        self.ref_counter.fetch_sub(1, Ordering::Relaxed)
-    }
+    pub fn decrement_ref_count(&self) -> bool{
+        let mut lock = self.state.lock().unwrap();
+        
+        debug_assert!(*lock.ref_counter != 0);
 
-    #[inline]
-    pub(crate) fn recycle(&mut self) {
-        self.state.lock().unwrap().free = true;
-        self.item_recycle.notify_all();
+        *lock.ref_counter -= 1;
+        if *lock.ref_counter == 0 {
+            self.item_recycle.notify_one();
+            true
+        } else {
+            false
+        }
+
     }
 
     #[inline]
@@ -111,23 +97,32 @@ impl<T> ItemCounter<T> {
         let state_lock = self
             .item_ready
             .wait_while(self.state.lock().unwrap(), |s| {
-                s.sequence < consumer_counter
+                *s.sequence < consumer_counter
             })
             .unwrap();
 
-        state_lock.terminator
+        *state_lock.sequence == usize::MAX
+    }
+
+    pub(crate) fn take_one(&mut self) -> bool {
+        let mut state_lock = self.state.lock().unwrap();
+
+        if *state_lock.ref_counter == 0 {
+            *state_lock.ref_counter = 1;
+            true
+        } else {
+            false
+        }
     }
 
     #[inline]
-    pub(crate) fn wait_until_free(&mut self, prod_sequnce: usize, ref_count: usize) {
+    pub(crate) fn wait_until_free(&mut self) {
         let mut state_lock = self
             .item_recycle
-            .wait_while(self.state.lock().unwrap(), |s| !s.free)
+            .wait_while(self.state.lock().unwrap(), |s| *s.ref_counter != 0)
             .unwrap();
 
-        state_lock.publish(prod_sequnce);
-        self.ref_counter.store(ref_count, Ordering::Relaxed);
-        drop(state_lock);
+        *state_lock.ref_counter = 1;
     }
 
     #[inline]
@@ -137,25 +132,24 @@ impl<T> ItemCounter<T> {
     {
         let mut state_lock = self
             .item_recycle
-            .wait_while(self.state.lock().unwrap(), |s| !s.free)
+            .wait_while(self.state.lock().unwrap(), |s| *s.ref_counter != 0)
             .unwrap();
 
-        // assert!(*lock == Some(prod_sequnce));
-        self.ref_counter.store(ref_count, Ordering::Relaxed);
         f(&mut self.item);
+        *state_lock.ref_counter = ref_count;
         state_lock.publish(prod_sequnce);
         drop(state_lock);
         
         self.item_ready.notify_all();
     }
 
-    pub(crate) fn mark_shutdown(&mut self, prod_sequnce: usize, ref_cnt: usize) {
+    pub(crate) fn mark_shutdown(&mut self, ref_cnt: usize) {
         let mut state_lock = self
             .item_recycle
-            .wait_while(self.state.lock().unwrap(), |s| !s.free)
+            .wait_while(self.state.lock().unwrap(), |s| *s.ref_counter != 0)
             .unwrap();
-        state_lock.set_termination_sequnece(prod_sequnce);
-        self.ref_counter.store(ref_cnt, Ordering::Relaxed);
+        state_lock.set_termination_sequnece();
+        *state_lock.ref_counter = ref_cnt;
         drop(state_lock);
 
         self.item_ready.notify_all();
@@ -181,7 +175,8 @@ pub trait StackBuffer: RecyclerBuffer {
 }
 
 pub trait ProducerConsumerBuffer: RecyclerBuffer {
-    const MAX: usize;
+
+    fn get_one(&mut self) -> Option<ContainerTypePtr<Self::ItemType>>;
 
     fn wait_for_one(&mut self) -> &mut ContainerType<Self::ItemType>;
 
@@ -305,71 +300,77 @@ impl<T> StackBuffer for DynamicBuffer<T> {
         let _lock = self.mutex.lock();
 
         self.index -= 1;
-        //*unsafe {self.data.get_unchecked_mut(self.index) } = item
-        //println!("recycling into index {}", self.index);
         self.data[self.index] = item.as_ptr();
         self.recycled_event.notify_one();
     }
 }
 
 #[derive(Debug)]
-pub struct StaticBuffer<T, const SIZE: usize>
-where
+pub struct SequenceBuffer<T, C> 
+where 
+    C: AsRef<[ItemCounter<T>]> + AsMut<[ItemCounter<T>]>,
     T: Send + Sync,
 {
-    data: [ContainerType<T>; SIZE],
+    data: C,
     consumer_count: u32,
     producer_counter: usize,
+    pd: PhantomData<T>
 }
 
-unsafe impl<T, const SIZE: usize> Send for StaticBuffer<T, SIZE> where T: Send + Sync {}
-
-impl<T, const SIZE: usize> StaticBuffer<T, SIZE>
-where
+impl<T, C> SequenceBuffer<T, C>
+where 
+    C: AsRef<[ItemCounter<T>]> + AsMut<[ItemCounter<T>]>,
     T: Send + Sync,
 {
-    pub fn new(data: [ContainerType<T>; SIZE]) -> Self {
-        for item in &data {
-            item.ref_counter.store(0, Ordering::Relaxed);
-        }
+    pub fn new(data: C) -> Self {
+
         Self {
             data,
             consumer_count: 0,
             producer_counter: 0,
+            pd: PhantomData
         }
     }
 
     #[inline]
     fn producer_next_item(&mut self) ->(&mut ContainerType<T>, usize, u32) { 
+        let cap = self.capacity() as usize;
         self.producer_counter += 1;
-        let current_producer_counter = self.producer_counter;
-        (&mut self.data[current_producer_counter % self.capacity()], current_producer_counter, self.consumer_count)
+        (&mut self.data.as_mut()[ self.producer_counter % cap],  self.producer_counter, self.consumer_count)
     }
 }
 
-impl<T, const SIZE: usize> RecyclerBuffer for StaticBuffer<T, SIZE>
-where
+impl<T, C> RecyclerBuffer for SequenceBuffer<T, C>
+where 
+    C: AsRef<[ItemCounter<T>]> + AsMut<[ItemCounter<T>]>,
     T: Send + Sync,
 {
     type ItemType = T;
 
     #[inline]
     fn capacity(&self) -> usize {
-        SIZE
+        self.data.as_ref().len()
     }
 }
 
-impl<T, const SIZE: usize> ProducerConsumerBuffer for StaticBuffer<T, SIZE>
-where
+impl<T, C> ProducerConsumerBuffer for SequenceBuffer<T, C>
+where 
+    C: AsRef<[ItemCounter<T>]> + AsMut<[ItemCounter<T>]>,
     T: Send + Sync,
 {
-    const MAX: usize = SIZE;
 
-
+    fn get_one(&mut self) -> Option<ContainerTypePtr<Self::ItemType>> {
+        let (next_item, _producer_counter, _consumer_count) = self.producer_next_item();
+        if next_item.take_one() {
+            Some(next_item)
+        } else {
+            None
+        }
+    }
     fn wait_for_one(&mut self) -> &mut ContainerType<Self::ItemType> {
-        
-        let (next_item, producer_counter, consumer_count) = self.producer_next_item();
-        next_item.wait_until_free(producer_counter, consumer_count as usize);
+        // takes an item from the buffer without publishing it to consumers
+        let (next_item, _producer_counter, _consumer_count) = self.producer_next_item();
+        next_item.wait_until_free();
         next_item
     }
 
@@ -394,7 +395,10 @@ where
         &mut self,
         consumer_counter: usize,
     ) -> Option<&mut ContainerType<Self::ItemType>> {
-        let item = &mut self.data[consumer_counter % self.capacity() as usize];
+        let cap = self.capacity();
+        let data = self.data.as_mut();
+
+        let item = &mut data[consumer_counter % cap as usize];
 
         if item.wait_until_ready(consumer_counter) {
             // println!("quitting this consumer");
@@ -406,10 +410,9 @@ where
 
     #[inline]
     fn shutdown(&mut self) {
-        let (next_item, producer_counter, consumer_count) = self.producer_next_item();
+        let (next_item, _producer_counter, consumer_count) = self.producer_next_item();
 
-        next_item.mark_shutdown(producer_counter, consumer_count as usize);
-
+        next_item.mark_shutdown(consumer_count as usize);
 
     }
 
@@ -517,9 +520,10 @@ where
         buf_ptr: GuardedBufferPtr<B>,
         item_ptr: NotNullItem<<B as RecyclerBuffer>::ItemType>,
     ) -> Self {
-        unsafe { item_ptr.as_ref() }
-            .ref_counter
-            .store(1, Ordering::Relaxed);
+        let item = unsafe { item_ptr.as_ref() };
+
+        let mut lock = item.state.lock().unwrap();
+        *lock.ref_counter = 1;
         Self { buf_ptr, item_ptr }
     }
 }
@@ -547,7 +551,7 @@ where
     #[inline]
     fn clone(&self) -> Self {
         unsafe {
-            self.item_ptr.as_ref().increment();
+            self.item_ptr.as_ref().increment_ref_count();
         }
 
         Self {
@@ -565,15 +569,17 @@ where
     #[inline]
     fn drop(&mut self) {
         let ptr = self.item_ptr;
-        let value = unsafe { ptr.as_ref() }.decrement();
+        let item = unsafe { ptr.as_ref() };
 
-        if value != 1 {
-            return;
-        }
+        
         // previous value was 1 one and after decrementing the counter we are now at zero
         // we are the last reference remaining. We are now responsible for returning the
         // data to the recycler
-        self.buf_ptr.get().recycle(ptr);
+
+        if item.decrement_ref_count() {
+            self.buf_ptr.get().recycle(ptr);
+        }
+        
     }
 }
 
@@ -589,3 +595,5 @@ where
     <B as RecyclerBuffer>::ItemType: Send + Sync,
 {
 }
+
+

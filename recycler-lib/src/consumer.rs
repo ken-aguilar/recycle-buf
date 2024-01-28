@@ -11,6 +11,7 @@ where
 {
     buf_ptr: GuardedBufferPtr<B>,
     consumer_counter: usize,
+    shutdown: bool,
 }
 
 unsafe impl<B> Send for Consumer<B>
@@ -29,21 +30,23 @@ where
         Self {
             buf_ptr,
             consumer_counter: 1,
+            shutdown: false
         }
     }
 
     #[inline]
     pub fn next_item(&mut self) -> Option<ConsumerRef<B>> {
+        if self.shutdown {
+            return None;
+        }
+
         let Some(item_counter_ptr) = self.buf_ptr.get().consume_next(self.consumer_counter) else {
+            self.shutdown = true;
             return None;
         };
 
         self.consumer_counter += 1;
 
-        if item_counter_ptr.decrement() == 1 {
-            // println!("attempting to reycle seq {:?}", item_counter.sequence);
-            item_counter_ptr.recycle();
-        }
 
         Some(ConsumerRef {
             consumer: self,
@@ -60,9 +63,13 @@ where
     where
         F: FnOnce(&<B as RecyclerBuffer>::ItemType),
     {
-        let buf_ptr = self.buf_ptr.get();
 
-        let Some(item_counter) = buf_ptr.consume_next(self.consumer_counter) else {
+        if self.shutdown {
+            return false;
+        }
+
+        let Some(item_counter) = self.buf_ptr.get().consume_next(self.consumer_counter) else {
+            self.shutdown = true;
             return false;
         };
 
@@ -70,12 +77,8 @@ where
 
         f(&item_counter.item);
 
-        // println!("{:?} consuming {}, rf cnt {}", std::thread::current().id(), self.consumer_counter, left);
 
-        if item_counter.decrement() == 1 {
-            // println!("attempting to reycle seq {:?}", item_counter.sequence);
-            item_counter.recycle();
-        }
+        item_counter.decrement_ref_count();
         true
     }
 }
@@ -110,10 +113,7 @@ where
     fn drop(&mut self) {
         let mut ptr = self.item_ptr;
         unsafe {
-            if ptr.as_mut().decrement() == 1 {
-                // we last
-                self.item_ptr.as_mut().recycle();
-            }
+            ptr.as_mut().decrement_ref_count();
         }
     }
 }
